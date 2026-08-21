@@ -22,24 +22,28 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SECRETS_DIR="$ROOT/.secrets"
 FLEET_FILE="$ROOT/vms.txt"
-FLAVOR="M"
-REGION="par"
-KEY_PATH="$SECRETS_DIR/id_ed25519"
+# fleet.conf holds the non-secret fleet settings (identity, size, region)
+# and is committed. Anything already in the environment wins over it, so a
+# one-off `FLAVOR=L ./provision.sh ...` still works.
+[ -f "$ROOT/fleet.conf" ] && . "$ROOT/fleet.conf"
+
+# .secrets/tokens.env is gitignored and holds the agent and forge tokens;
+# ./agent-tokens.sh fills it.
+[ -f "$SECRETS_DIR/tokens.env" ] && . "$SECRETS_DIR/tokens.env"
+
+FLAVOR="${FLAVOR:-M}"
+REGION="${REGION:-par}"
+KEY_PATH="${KEY_PATH:-$SECRETS_DIR/id_ed25519}"
 PER_VM_KEY=false
 DEPLOY=true
 COUNT=1
-CELLAR_SHARED=""
-CONFIG_ADDON="vm-agent-config"
+CELLAR_SHARED="${CELLAR_SHARED:-}"
+CONFIG_ADDON="${CONFIG_ADDON:-vm-agent-config}"
 FORGET=()
 GIT_NAME="${GIT_USER_NAME:-vm-agent}"
 GIT_EMAIL="${GIT_USER_EMAIL:-vm-agent@clever-cloud.local}"
 SIGN_COMMITS="${GIT_SIGN_COMMITS:-false}"
 GITLAB_HOST_VALUE="${GITLAB_HOST:-gitlab.com}"
-
-# .secrets/tokens.env is gitignored; export GH_TOKEN / GITLAB_TOKEN there.
-[ -f "$SECRETS_DIR/tokens.env" ] && . "$SECRETS_DIR/tokens.env"
-# Agent and forge tokens come from .secrets/tokens.env or the surrounding
-# shell; see ./agent-tokens.sh for a helper that fills that file.
 
 # ---------------------------------------------------------------- output
 c_ok=$'\033[32m'; c_skip=$'\033[2m'; c_do=$'\033[36m'; c_err=$'\033[31m'; c_off=$'\033[0m'

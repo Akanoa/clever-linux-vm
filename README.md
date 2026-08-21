@@ -49,9 +49,14 @@ env when it takes ownership of a key.
 `--per-vm-key` opts out of the shared commit key and generates one per box,
 kept in the app's own env instead.
 
-Options: `--flavor` (default `M`), `--region` (default `par`),
-`--config <addon-name>`, `--cellar <addon-name>`, `--key <path>`,
-`--per-vm-key`, `--no-deploy`.
+Fleet-wide settings live in `fleet.conf` (committed — none of it is
+secret): commit identity, signing, GitLab host, default flavor and region.
+An environment variable of the same name overrides it, so a one-off
+`FLAVOR=L ./provision.sh big-agent` still works.
+
+Options: `--flavor`, `--region`, `--config <addon-name>`,
+`--cellar <addon-name>`, `--key <path>`, `--per-vm-key`, `--no-deploy`,
+`--forget <VAR>`.
 
 Tokens come from `.secrets/tokens.env` (gitignored) or the surrounding
 environment. **An empty local token never blanks one already in the
@@ -222,6 +227,7 @@ bin/cellar                 s3cmd wrapper for the Cellar bucket
 bin/vm-snapshot            agent state -> FS Bucket
 provision.sh               idempotent fleet provisioner (runs locally)
 agent-tokens.sh            fills .secrets/tokens.env (runs locally)
+fleet.conf                 non-secret fleet settings (committed)
 connect.sh                 local helper: ssh / herdr attach
 vms.txt                    fleet registry
 ```
