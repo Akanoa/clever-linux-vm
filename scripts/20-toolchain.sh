@@ -57,7 +57,7 @@ install_glab() {
 }
 
 install_helpers() {
-  install -m 755 "$APP_HOME/bin/cellar" "$HOME/.local/bin/cellar"
+  install -m 755 "$APP_HOME/tools/cellar" "$HOME/.local/bin/cellar"
 }
 
 # Downloads are independent; run them concurrently to keep boot short.

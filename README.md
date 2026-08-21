@@ -221,6 +221,10 @@ unverified address makes every signed commit show up as unverified.
 
 ## Layout
 
+`scripts/` runs unattended during boot and is called by full path;
+`tools/` is installed into `~/.local/bin` for you to type at a prompt.
+Everything here is bash, apart from the Python status server.
+
 ```
 boot.sh                    orchestrator: health first, then provisioning
 scripts/lib.sh             shared helpers
@@ -231,8 +235,8 @@ scripts/15-agent-auth.sh   agent credentials (claude / codex / opencode)
 scripts/20-toolchain.sh    installs the agents, herdr, gh, glab
 scripts/30-shell.sh        makes `clever ssh` sessions match the boot env
 scripts/40-herdr.sh        starts the headless herdr server
-bin/cellar                 s3cmd wrapper for the Cellar bucket
-bin/vm-snapshot            agent state -> FS Bucket
+tools/cellar               s3cmd wrapper for the Cellar bucket
+tools/vm-snapshot          agent state -> FS Bucket
 provision.sh               idempotent fleet provisioner (runs locally)
 agent-tokens.sh            fills .secrets/tokens.env (runs locally)
 fleet.conf.example         template for fleet.conf (gitignored)

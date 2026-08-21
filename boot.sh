@@ -50,7 +50,7 @@ stage "ready"
 log "ready - attach with: clever ssh --app ${CC_APP_NAME:-vm-agent}   then run: herdr"
 
 # --- 3. periodic state snapshot to the FS Bucket ------------------------
-install -m 755 "$APP_HOME/bin/vm-snapshot" "$HOME/.local/bin/vm-snapshot" 2>/dev/null || true
+install -m 755 "$APP_HOME/tools/vm-snapshot" "$HOME/.local/bin/vm-snapshot" 2>/dev/null || true
 (
   while true; do
     sleep "$SNAPSHOT_INTERVAL"
