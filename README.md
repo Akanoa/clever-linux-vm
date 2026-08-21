@@ -6,12 +6,11 @@ working while nobody is attached.
 
 | | |
 |---|---|
-| App | `vm-agent` (`app_<id>`) |
 | Runtime | `linux` (Exherbo, user `bas`, **no root, no package manager**) |
-| Flavor | M — 4 vCPU / 4 GB |
-| Persistence | FS Bucket `vm-agent-fs` mounted at `$APP_HOME/persistent` |
-| Object storage | Cellar `vm-agent-cellar`, bucket `vm-agent-files` |
-| Health | `https://app-<id>.cleverapps.io/status` |
+| Default flavor | M — 4 vCPU / 4 GB |
+| Persistence | one FS Bucket per VM, mounted at `$APP_HOME/persistent` |
+| Object storage | one Cellar bucket per VM, `<vm-name>-files` |
+| Health | `https://app-<id>.cleverapps.io/status` — `./provision.sh --list` prints the real URLs |
 
 ## Provisioning a VM
 
@@ -49,9 +48,15 @@ env when it takes ownership of a key.
 `--per-vm-key` opts out of the shared commit key and generates one per box,
 kept in the app's own env instead.
 
-Fleet-wide settings live in `fleet.conf` (committed — none of it is
-secret): commit identity, signing, GitLab host, default flavor and region.
-An environment variable of the same name overrides it, so a one-off
+Fleet-wide settings live in `fleet.conf`: commit identity, signing, GitLab
+host, default flavor and region. Start from the template:
+
+```bash
+cp fleet.conf.example fleet.conf
+```
+
+It is gitignored, because it carries your name and email. An environment
+variable of the same name overrides it, so a one-off
 `FLAVOR=L ./provision.sh big-agent` still works.
 
 Options: `--flavor`, `--region`, `--config <addon-name>`,
@@ -63,9 +68,12 @@ environment. **An empty local token never blanks one already in the
 provider** — it is read back and kept, so running `--all` without secrets
 in your shell is safe.
 
-`vms.txt` is the fleet registry and is committed; `.secrets/` is not.
 `--destroy` removes an app and its own two add-ons, never the shared
 provider.
+
+Nothing account-specific is tracked: `.clever.json`, `fleet.conf`,
+`vms.txt` and `.secrets/` are all gitignored, so this repository is safe to
+publish.
 
 ## Agent tokens
 
@@ -192,24 +200,24 @@ The commit key is installed to `~/.ssh/id_ed25519` at boot, GitHub and
 GitLab host keys are pre-seeded into `~/.ssh/known_hosts`, and `~/.ssh/config`
 pins the key for every host.
 
-### Current state
+### Registering the key on your forges
 
-* **GitLab** — `GITLAB_TOKEN` set, `glab` authenticated as `<forge-user>`. The
-  public key is registered on the account as *vm-agent (Clever Cloud)* with
-  `usage_type=auth_and_signing`, and `GIT_SIGN_COMMITS=true`, so commits
-  made on the box show as Verified.
-* **GitHub** — `GH_TOKEN` is still empty. Set it, then add the same public
-  key at <https://github.com/settings/keys> (as both an authentication and
-  a signing key) for SSH pushes and verified commits.
+`provision.sh` prints the public key when it finishes. Add it as **both**
+an authentication and a signing key:
 
-The public key:
+* **GitHub** — <https://github.com/settings/keys>
+* **GitLab** — the CLI can do it once `GITLAB_TOKEN` is set:
 
-```
-ssh-ed25519 <public key> vm-agent@clever-cloud
-```
+  ```bash
+  glab api --method POST /user/keys \
+    -f "title=vm-agent (Clever Cloud)" \
+    -f "key=$(cat .secrets/id_ed25519.pub)" \
+    -f usage_type=auth_and_signing
+  ```
 
-`GIT_USER_EMAIL` is `you@example.com` — the only address verified on the
-GitLab account, which is what signature verification matches against.
+Set `GIT_USER_EMAIL` in `fleet.conf` to an address **verified on the
+forge** — that is what signature verification matches against, and an
+unverified address makes every signed commit show up as unverified.
 
 ## Layout
 
@@ -227,17 +235,18 @@ bin/cellar                 s3cmd wrapper for the Cellar bucket
 bin/vm-snapshot            agent state -> FS Bucket
 provision.sh               idempotent fleet provisioner (runs locally)
 agent-tokens.sh            fills .secrets/tokens.env (runs locally)
-fleet.conf                 non-secret fleet settings (committed)
+fleet.conf.example         template for fleet.conf (gitignored)
 connect.sh                 local helper: ssh / herdr attach
-vms.txt                    fleet registry
+vms.txt                    fleet registry (gitignored)
 ```
 
 ## Debugging
 
 ```bash
+./provision.sh --list                 # prints each VM's status URL
 curl https://app-<id>.cleverapps.io/status
 curl https://app-<id>.cleverapps.io/logs
-clever logs --app vm-agent
+clever logs --alias <vm-name>
 ```
 
 Inside the box, `vm-status` and `vm-log` are aliases for the same thing.

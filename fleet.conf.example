@@ -1,0 +1,22 @@
+# Fleet-wide settings for provision.sh.
+#
+#     cp fleet.conf.example fleet.conf
+#
+# fleet.conf is gitignored because it carries your name and email; secrets
+# live in .secrets/tokens.env (see ./agent-tokens.sh).
+#
+# Every value is a default - an environment variable of the same name takes
+# precedence, so `FLAVOR=L ./provision.sh big-agent` still works.
+
+# Commit identity used on every VM. GIT_USER_EMAIL must be an address
+# verified on the forge, otherwise signatures show as unverified.
+: "${GIT_USER_NAME:=Your Name}"
+: "${GIT_USER_EMAIL:=you@example.com}"
+: "${GIT_SIGN_COMMITS:=true}"
+
+# gitlab.com, or the host of a self-managed instance.
+: "${GITLAB_HOST:=gitlab.com}"
+
+# Default size and region for new VMs.
+: "${FLAVOR:=M}"
+: "${REGION:=par}"

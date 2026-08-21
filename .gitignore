@@ -3,3 +3,8 @@ node_modules/
 *.log
 persistent/
 .secrets/
+
+# Local, account-specific state - never publish
+.clever.json
+fleet.conf
+vms.txt
