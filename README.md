@@ -28,18 +28,37 @@ partial failure resumes where it stopped.
 ```
 
 Each VM gets its own application, its own FS Bucket and its own Cellar
-add-on (`--cellar <name>` reuses a shared one instead). They share a single
-git-commit key at `.secrets/id_ed25519`, so the public key only has to be
-registered on the forges once; `--per-vm-key` gives each box its own.
+add-on (`--cellar <name>` reuses a shared one instead).
+
+Everything the fleet has in common lives in a single free **Configuration
+provider** add-on, `vm-agent-config`, linked to every app:
+
+| Shared (config provider) | Per-VM (app env) |
+|---|---|
+| `VM_AGENT_SSH_KEY_B64` | `CC_FS_BUCKET` |
+| `GH_TOKEN`, `GITLAB_TOKEN`, `GITLAB_HOST` | `CELLAR_BUCKET` |
+| `GIT_USER_NAME`, `GIT_USER_EMAIL`, `GIT_SIGN_COMMITS` | `VM_AGENT_NAME` |
+
+So a token is rotated in one place and every box picks it up — Clever Cloud
+restarts the linked applications automatically. Values set directly on an
+app would shadow the provider, so `provision.sh` removes them from the app
+env when it takes ownership of a key.
+
+`--per-vm-key` opts out of the shared commit key and generates one per box,
+kept in the app's own env instead.
 
 Options: `--flavor` (default `M`), `--region` (default `par`),
-`--no-deploy`, `--key <path>`.
+`--config <addon-name>`, `--cellar <addon-name>`, `--key <path>`,
+`--per-vm-key`, `--no-deploy`.
 
 Tokens come from `.secrets/tokens.env` (gitignored) or the surrounding
-environment. **An empty local token never overwrites one already stored on
-an app** — so running `--all` without secrets in your shell is safe.
+environment. **An empty local token never blanks one already in the
+provider** — it is read back and kept, so running `--all` without secrets
+in your shell is safe.
 
 `vms.txt` is the fleet registry and is committed; `.secrets/` is not.
+`--destroy` removes an app and its own two add-ons, never the shared
+provider.
 
 ## Connecting
 
@@ -109,13 +128,17 @@ cellar url datasets/dataset.parquet      # presigned link, 1h
 | `GIT_USER_NAME` / `GIT_USER_EMAIL` | commit identity |
 | `GIT_SIGN_COMMITS` | `true` to SSH-sign every commit |
 
-Set them with:
+All of these are fleet-wide, so set them once in `.secrets/tokens.env` (or
+your shell) and re-run the provisioner:
 
 ```bash
-clever env set GH_TOKEN "ghp_..."      --app vm-agent
-clever env set GITLAB_TOKEN "glpat_..." --app vm-agent
-clever restart --app vm-agent
+echo 'export GH_TOKEN="ghp_..."' >> .secrets/tokens.env
+./provision.sh --all --no-deploy
 ```
+
+Every linked VM restarts with the new value. `clever env set --alias <vm>`
+still works for a genuinely per-box override, but the next `provision.sh`
+run will remove it again for any key the provider owns.
 
 The commit key is installed to `~/.ssh/id_ed25519` at boot, GitHub and
 GitLab host keys are pre-seeded into `~/.ssh/known_hosts`, and `~/.ssh/config`
