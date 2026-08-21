@@ -228,7 +228,8 @@ provision_one() {
 
   # --- scaling ----------------------------------------------------------
   local current_flavor
-  current_flavor="$(clever status --alias "$name" 2>/dev/null | sed -n 's/^ *Sizes: *//p' | head -1)"
+  current_flavor="$(clever status --alias "$name" --format json 2>/dev/null \
+    | jq -r '.instances[0].flavor // ""')"
   if [ "$current_flavor" = "$FLAVOR" ]; then
     skip "flavor already $FLAVOR"
   else
@@ -339,18 +340,20 @@ provision_one() {
 do_list() {
   hdr "fleet"
   [ -s "$FLEET_FILE" ] || { skip "no VMs provisioned yet"; return; }
-  printf '  %-20s %-10s %-38s %s\n' NAME STATE APP_ID FLAVOR
+  printf '  %-18s %-9s %-3s %-40s %s\n' NAME STATE SIZE APP_ID STATUS_URL
+  local name status state flavor id
   while read -r name; do
     [ -n "$name" ] || continue
-    local id state flavor
-    id="$(app_id_by_name "$name")"
-    if [ -z "$id" ]; then
-      printf '  %-20s %-10s %s\n' "$name" "MISSING" "-"
+    status="$(clever status --alias "$name" --format json 2>/dev/null)"
+    if [ -z "$status" ]; then
+      printf '  %-18s %-9s\n' "$name" "MISSING"
       continue
     fi
-    state="$(clever status --alias "$name" 2>/dev/null | sed -n '1s/.*: *//p' | tr -d '\033[]0-9;m')"
-    flavor="$(clever status --alias "$name" 2>/dev/null | sed -n 's/^ *Sizes: *//p' | head -1)"
-    printf '  %-20s %-10s %-38s %s\n' "$name" "${state:-?}" "$id" "${flavor:-?}"
+    id="$(printf '%s' "$status"     | jq -r '.id')"
+    state="$(printf '%s' "$status"  | jq -r '.status')"
+    flavor="$(printf '%s' "$status" | jq -r '.instances[0].flavor // "?"')"
+    printf '  %-18s %-9s %-3s %-40s %s\n' "$name" "$state" "$flavor" "$id" \
+      "https://app-${id#app_}.cleverapps.io/status"
   done < "$FLEET_FILE"
 }
 
