@@ -14,6 +14,7 @@
 #   ./provision.sh agent --count 4           agent-1 .. agent-4
 #   ./provision.sh --all                     re-apply to every VM in vms.txt
 #   ./provision.sh --list                    show the fleet
+#   ./provision.sh --all --forget OPENAI_API_KEY   drop a shared secret
 #   ./provision.sh --destroy agent-3 --yes   tear one down
 set -uo pipefail
 
@@ -29,6 +30,7 @@ DEPLOY=true
 COUNT=1
 CELLAR_SHARED=""
 CONFIG_ADDON="vm-agent-config"
+FORGET=()
 GIT_NAME="${GIT_USER_NAME:-vm-agent}"
 GIT_EMAIL="${GIT_USER_EMAIL:-vm-agent@clever-cloud.local}"
 SIGN_COMMITS="${GIT_SIGN_COMMITS:-false}"
@@ -154,6 +156,13 @@ sync_shared_config() {
   add_var GIT_SIGN_COMMITS "$SIGN_COMMITS"
 
   for var in "${SHARED_SECRETS[@]}"; do
+    # --forget is the only way to take a secret back out: an empty local
+    # value means "keep what the provider has", not "delete it".
+    if [ "${#FORGET[@]}" -gt 0 ] && printf '%s\n' "${FORGET[@]}" | grep -qxF "$var"; then
+      printf '%s' "$current" | jq -e --arg n "$var" '.[]? | select(.name==$n)' >/dev/null 2>&1 \
+        && ok "$var will be removed from the shared config"
+      continue
+    fi
     want="${!var:-}"
     [ -z "$want" ] && want="$(printf '%s' "$current" \
       | jq -r --arg n "$var" '.[]? | select(.name==$n) | .value' | head -1)"
@@ -396,6 +405,8 @@ while [ $# -gt 0 ]; do
     --region)   REGION="$2"; shift 2 ;;
     --count)    COUNT="$2"; shift 2 ;;
     --cellar)   CELLAR_SHARED="$2"; shift 2 ;;
+    --config)   CONFIG_ADDON="$2"; shift 2 ;;
+    --forget)   FORGET+=("$2"); shift 2 ;;
     --key)      KEY_PATH="$2"; shift 2 ;;
     --per-vm-key) PER_VM_KEY=true; shift ;;
     --no-deploy)  DEPLOY=false; shift ;;

@@ -74,6 +74,14 @@ the config provider, and every linked VM restarts with the new value.
 ./provision.sh --all --no-deploy       # apply to the fleet
 ```
 
+Removing a secret needs `--forget`, because an empty local value means
+"keep whatever the provider has" rather than "delete it":
+
+```bash
+./agent-tokens.sh unset OPENAI_API_KEY
+./provision.sh --all --no-deploy --forget OPENAI_API_KEY
+```
+
 How each agent picks its credentials up:
 
 | Agent | Mechanism |
