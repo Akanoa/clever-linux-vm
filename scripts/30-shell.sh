@@ -19,7 +19,7 @@ cat > "$RC" <<'RCEOF'
 export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
 export npm_config_prefix="$HOME/.local"
 export EDITOR="${EDITOR:-vim}"
-export PERSIST_ROOT="${PERSIST_ROOT:-/home/bas/persistent}"
+export PERSIST_ROOT="${APP_HOME:-$HOME}/persistent"
 
 # Land in the persistent workspace rather than the app checkout.
 if [ -n "${PS1:-}" ] && [ "$PWD" = "$HOME" ] && [ -d "$HOME/workspace" ]; then

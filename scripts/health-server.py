@@ -40,8 +40,9 @@ def payload():
         "deployment": os.environ.get("CC_DEPLOYMENT_ID"),
         "stage": read_stage(),
         "ready": read_stage() == "ready",
-        "persistent_storage": os.path.ismount(
-            os.environ.get("PERSIST_ROOT", "/home/bas/persistent")),
+        "persistent_storage": os.path.ismount(os.environ.get(
+            "PERSIST_ROOT",
+            os.path.join(os.environ.get("APP_HOME", "~"), "persistent"))),
         "tools": tool_versions(),
     }
 

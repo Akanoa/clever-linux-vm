@@ -6,7 +6,7 @@
 # history are captured.
 set -uo pipefail
 
-PERSIST_ROOT="${PERSIST_ROOT:-/home/bas/persistent}"
+PERSIST_ROOT="${PERSIST_ROOT:-${APP_HOME:-$HOME}/persistent}"
 LOCK="/tmp/vm-agent-snapshot.lock"
 
 SYNC_DIRS=(

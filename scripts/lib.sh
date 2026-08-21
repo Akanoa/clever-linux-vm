@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Shared helpers for the vm-agent boot scripts.
 
-# Persistent root: the FS Bucket is mounted here by the platform when
-# CC_FS_BUCKET points at it. Falls back to a local dir when unmounted.
-PERSIST_ROOT="${PERSIST_ROOT:-/home/bas/persistent}"
+# Persistent root: the FS Bucket is mounted here by the platform.
+# CC_FS_BUCKET paths are resolved *relative to APP_HOME*, so the mount
+# lands at $APP_HOME/persistent rather than at an absolute /persistent.
+PERSIST_ROOT="${PERSIST_ROOT:-${APP_HOME:-$HOME}/persistent}"
 STATE_FILE="${STATE_FILE:-/tmp/vm-agent-state}"
 BOOT_LOG="${BOOT_LOG:-/tmp/vm-agent-boot.log}"
 

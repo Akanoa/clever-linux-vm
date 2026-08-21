@@ -7,7 +7,7 @@
 set -uo pipefail
 
 export APP_HOME="${APP_HOME:-$(cd "$(dirname "$0")" && pwd)}"
-export PERSIST_ROOT="${PERSIST_ROOT:-/home/bas/persistent}"
+export PERSIST_ROOT="${PERSIST_ROOT:-$APP_HOME/persistent}"
 export STATE_FILE="/tmp/vm-agent-state"
 export BOOT_LOG="/tmp/vm-agent-boot.log"
 export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"

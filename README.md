@@ -9,7 +9,7 @@ working while nobody is attached.
 | App | `vm-agent` (`app_<id>`) |
 | Runtime | `linux` (Exherbo, user `bas`, **no root, no package manager**) |
 | Flavor | M — 4 vCPU / 4 GB |
-| Persistence | FS Bucket `vm-agent-fs` mounted at `/home/bas/persistent` |
+| Persistence | FS Bucket `vm-agent-fs` mounted at `$APP_HOME/persistent` |
 | Object storage | Cellar `vm-agent-cellar`, bucket `vm-agent-files` |
 | Health | `https://app-<id>.cleverapps.io/status` |
 
