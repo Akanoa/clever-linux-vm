@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Copy agent state from local disk onto the FS Bucket.
+#
+# Runs every few minutes from the boot script, and can be called by hand
+# before a `clever restart` to be sure the latest credentials and agent
+# history are captured.
+set -uo pipefail
+
+PERSIST_ROOT="${PERSIST_ROOT:-/home/bas/persistent}"
+LOCK="/tmp/vm-agent-snapshot.lock"
+
+SYNC_DIRS=(
+  "claude:$HOME/.claude"
+  "codex:$HOME/.codex"
+  "opencode-data:$HOME/.local/share/opencode"
+  "opencode-config:$HOME/.config/opencode"
+  "herdr:$HOME/.config/herdr"
+  "gh:$HOME/.config/gh"
+  "glab:$HOME/.config/glab-cli"
+)
+EXCLUDES=(--exclude='*.sock' --exclude='*.lock' --exclude='*.log' --exclude='.plugins.lock')
+
+snapshot() {
+  local name path dst
+  for entry in "${SYNC_DIRS[@]}"; do
+    name="${entry%%:*}"; path="${entry#*:}"; dst="$PERSIST_ROOT/state/$name"
+    [ -d "$path" ] || continue
+    mkdir -p "$dst"
+    rsync -a --delete "${EXCLUDES[@]}" "$path/" "$dst/" 2>/dev/null \
+      || echo "vm-snapshot: failed to sync $name" >&2
+  done
+  date -u +'%Y-%m-%dT%H:%M:%SZ' > "$PERSIST_ROOT/state/.last-snapshot" 2>/dev/null
+}
+
+# Never let two snapshots overlap; -n so the periodic loop skips rather
+# than queues if the previous run is still going.
+exec 9>"$LOCK"
+if flock -n 9; then
+  snapshot
+  [ "${1:-}" = "--quiet" ] || echo "vm-snapshot: state saved to $PERSIST_ROOT/state"
+else
+  [ "${1:-}" = "--quiet" ] || echo "vm-snapshot: another snapshot is running, skipped"
+fi

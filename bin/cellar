@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Thin wrapper around s3cmd for the app's Cellar bucket.
+#
+#   cellar put ./big-model.bin            -> s3://$CELLAR_BUCKET/big-model.bin
+#   cellar put ./dir/ datasets/           -> recursive upload under datasets/
+#   cellar get datasets/train.parquet     -> downloads into the cwd
+#   cellar ls [prefix]
+#   cellar rm <key>
+#   cellar url <key>                      -> presigned link, valid 1h
+set -uo pipefail
+
+BUCKET="${CELLAR_BUCKET:-}"
+if [ -z "$BUCKET" ]; then
+  echo "cellar: CELLAR_BUCKET is not set" >&2
+  exit 1
+fi
+
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  put)
+    src="${1:?usage: cellar put <path> [remote-prefix]}"
+    dest="s3://$BUCKET/${2:-}"
+    if [ -d "$src" ]; then
+      s3cmd put --recursive "$src" "$dest"
+    else
+      s3cmd put "$src" "$dest"
+    fi
+    ;;
+  get)
+    key="${1:?usage: cellar get <key> [local-path]}"
+    s3cmd get "s3://$BUCKET/$key" "${2:-.}"
+    ;;
+  ls)   s3cmd ls "s3://$BUCKET/${1:-}" ;;
+  rm)   s3cmd del "s3://$BUCKET/${1:?usage: cellar rm <key>}" ;;
+  du)   s3cmd du "s3://$BUCKET" ;;
+  url)  s3cmd signurl "s3://$BUCKET/${1:?usage: cellar url <key>}" "$(( $(date +%s) + 3600 ))" ;;
+  ""|-h|--help) usage ;;
+  *)    exec s3cmd "$cmd" "$@" ;;
+esac
