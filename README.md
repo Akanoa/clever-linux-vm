@@ -13,11 +13,39 @@ working while nobody is attached.
 | Object storage | Cellar `vm-agent-cellar`, bucket `vm-agent-files` |
 | Health | `https://app-<id>.cleverapps.io/status` |
 
+## Provisioning a VM
+
+`provision.sh` is idempotent: every step checks the desired state before
+touching anything, so re-running it is a no-op and re-running after a
+partial failure resumes where it stopped.
+
+```bash
+./provision.sh web-agent               # create or update one VM, then deploy
+./provision.sh agent --count 4         # agent-1 .. agent-4, running in parallel
+./provision.sh --all                   # re-apply to every VM in vms.txt
+./provision.sh --list                  # fleet overview
+./provision.sh --destroy agent-3 --yes # tear one down, add-ons included
+```
+
+Each VM gets its own application, its own FS Bucket and its own Cellar
+add-on (`--cellar <name>` reuses a shared one instead). They share a single
+git-commit key at `.secrets/id_ed25519`, so the public key only has to be
+registered on the forges once; `--per-vm-key` gives each box its own.
+
+Options: `--flavor` (default `M`), `--region` (default `par`),
+`--no-deploy`, `--key <path>`.
+
+Tokens come from `.secrets/tokens.env` (gitignored) or the surrounding
+environment. **An empty local token never overwrites one already stored on
+an app** — so running `--all` without secrets in your shell is safe.
+
+`vms.txt` is the fleet registry and is committed; `.secrets/` is not.
+
 ## Connecting
 
 ```bash
-clever ssh --app vm-agent   # opens a shell on the running instance
-herdr                       # attach to the persistent session
+clever ssh --alias <vm-name>   # opens a shell on the running instance
+herdr                          # attach to the persistent session
 ```
 
 `ctrl+b q` detaches and leaves every agent running. From a laptop that has
@@ -125,7 +153,9 @@ scripts/30-shell.sh        makes `clever ssh` sessions match the boot env
 scripts/40-herdr.sh        starts the headless herdr server
 bin/cellar                 s3cmd wrapper for the Cellar bucket
 bin/vm-snapshot            agent state -> FS Bucket
+provision.sh               idempotent fleet provisioner (runs locally)
 connect.sh                 local helper: ssh / herdr attach
+vms.txt                    fleet registry
 ```
 
 ## Debugging
