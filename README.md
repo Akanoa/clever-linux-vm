@@ -38,6 +38,8 @@ provider** add-on, `vm-agent-config`, linked to every app:
 | `VM_AGENT_SSH_KEY_B64` | `CC_FS_BUCKET` |
 | `GH_TOKEN`, `GITLAB_TOKEN`, `GITLAB_HOST` | `CELLAR_BUCKET` |
 | `GIT_USER_NAME`, `GIT_USER_EMAIL`, `GIT_SIGN_COMMITS` | `VM_AGENT_NAME` |
+| `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` | |
+| `OPENAI_API_KEY`, `OPENROUTER_API_KEY` | |
 
 So a token is rotated in one place and every box picks it up — Clever Cloud
 restarts the linked applications automatically. Values set directly on an
@@ -59,6 +61,39 @@ in your shell is safe.
 `vms.txt` is the fleet registry and is committed; `.secrets/` is not.
 `--destroy` removes an app and its own two add-ons, never the shared
 provider.
+
+## Agent tokens
+
+`agent-tokens.sh` fills `.secrets/tokens.env`; `provision.sh` pushes it to
+the config provider, and every linked VM restarts with the new value.
+
+```bash
+./agent-tokens.sh                      # what is set, masked
+./agent-tokens.sh claude               # run `claude setup-token`, store the result
+./agent-tokens.sh set OPENAI_API_KEY   # hidden prompt for any supported key
+./provision.sh --all --no-deploy       # apply to the fleet
+```
+
+How each agent picks its credentials up:
+
+| Agent | Mechanism |
+|---|---|
+| `claude` | reads `CLAUDE_CODE_OAUTH_TOKEN`, else `ANTHROPIC_API_KEY`, else the restored session |
+| `opencode` | reads `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `OPENROUTER_API_KEY` |
+| `codex` | keeps credentials in a file, so boot runs `codex login --with-api-key` when `OPENAI_API_KEY` is set |
+
+`claude setup-token` needs a Claude subscription and issues one long-lived
+token that serves the whole fleet — unlike copying `~/.claude/.credentials.json`,
+which would make every VM refresh the same OAuth session and invalidate
+each other.
+
+Interactive `claude auth login`, `codex login` and `opencode auth login`
+inside a box still work, and the state snapshot carries them across
+restarts. `/status` reports what each agent found:
+
+```json
+"agent_auth": { "claude": "subscription-token", "codex": null, "opencode": ["anthropic"] }
+```
 
 ## Connecting
 
@@ -171,12 +206,14 @@ scripts/lib.sh             shared helpers
 scripts/health-server.py   status endpoint on :8080 (required by the runtime)
 scripts/00-persist.sh      FS Bucket wiring + state restore
 scripts/10-secrets.sh      SSH key, git identity, gh/glab, Cellar
+scripts/15-agent-auth.sh   agent credentials (claude / codex / opencode)
 scripts/20-toolchain.sh    installs the agents, herdr, gh, glab
 scripts/30-shell.sh        makes `clever ssh` sessions match the boot env
 scripts/40-herdr.sh        starts the headless herdr server
 bin/cellar                 s3cmd wrapper for the Cellar bucket
 bin/vm-snapshot            agent state -> FS Bucket
 provision.sh               idempotent fleet provisioner (runs locally)
+agent-tokens.sh            fills .secrets/tokens.env (runs locally)
 connect.sh                 local helper: ssh / herdr attach
 vms.txt                    fleet registry
 ```

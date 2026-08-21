@@ -37,6 +37,9 @@ bash "$APP_HOME/scripts/20-toolchain.sh" || log "toolchain step reported errors"
 stage "secrets"
 bash "$APP_HOME/scripts/10-secrets.sh"   || log "secrets step reported errors"
 
+stage "agent-auth"
+bash "$APP_HOME/scripts/15-agent-auth.sh" || log "agent auth step reported errors"
+
 stage "shell"
 bash "$APP_HOME/scripts/30-shell.sh"     || log "shell step reported errors"
 

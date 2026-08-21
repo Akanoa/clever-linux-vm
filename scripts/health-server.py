@@ -33,6 +33,38 @@ def tool_versions():
     return {tool: shutil.which(tool, path=search) for tool in TOOLS}
 
 
+def agent_auth():
+    """Which agents have credentials, without ever revealing them."""
+    home = os.path.expanduser("~")
+
+    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        claude = "subscription-token"
+    elif os.environ.get("ANTHROPIC_API_KEY"):
+        claude = "api-key"
+    elif os.path.exists(os.path.join(home, ".claude/.credentials.json")):
+        claude = "session"
+    else:
+        claude = None
+
+    if os.path.exists(os.path.join(home, ".codex/auth.json")):
+        codex = "logged-in"
+    elif os.environ.get("OPENAI_API_KEY"):
+        codex = "api-key"
+    else:
+        codex = None
+
+    providers = [name for name, var in (
+        ("anthropic", "ANTHROPIC_API_KEY"),
+        ("openai", "OPENAI_API_KEY"),
+        ("openrouter", "OPENROUTER_API_KEY"),
+    ) if os.environ.get(var)]
+    if not providers and os.path.exists(
+            os.path.join(home, ".local/share/opencode/auth.json")):
+        providers = ["stored-credentials"]
+
+    return {"claude": claude, "codex": codex, "opencode": providers or None}
+
+
 def payload():
     return {
         "app": os.environ.get("CC_APP_NAME", "vm-agent"),
@@ -44,6 +76,7 @@ def payload():
             "PERSIST_ROOT",
             os.path.join(os.environ.get("APP_HOME", "~"), "persistent"))),
         "tools": tool_versions(),
+        "agent_auth": agent_auth(),
     }
 
 

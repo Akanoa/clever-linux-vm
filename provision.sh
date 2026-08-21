@@ -36,8 +36,8 @@ GITLAB_HOST_VALUE="${GITLAB_HOST:-gitlab.com}"
 
 # .secrets/tokens.env is gitignored; export GH_TOKEN / GITLAB_TOKEN there.
 [ -f "$SECRETS_DIR/tokens.env" ] && . "$SECRETS_DIR/tokens.env"
-GH_TOKEN="${GH_TOKEN:-}"
-GITLAB_TOKEN="${GITLAB_TOKEN:-}"
+# Agent and forge tokens come from .secrets/tokens.env or the surrounding
+# shell; see ./agent-tokens.sh for a helper that fills that file.
 
 # ---------------------------------------------------------------- output
 c_ok=$'\033[32m'; c_skip=$'\033[2m'; c_do=$'\033[36m'; c_err=$'\033[31m'; c_off=$'\033[0m'
@@ -124,43 +124,49 @@ ensure_config_provider() {
   printf '%s' "$id"
 }
 
-# Writes the fleet-wide variables. A token we do not hold locally is read
-# back from the provider rather than blanked, so `--all` without secrets in
-# the shell is safe. Changing a value restarts every linked app.
+# Secrets we may not hold locally. An empty local value is read back from
+# the provider rather than blanking it, so `--all` without secrets in the
+# shell is safe. Anything absent on both sides is simply not written.
+SHARED_SECRETS=(
+  GH_TOKEN GITLAB_TOKEN
+  CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY
+)
+# Non-secret settings, always taken from the local configuration.
+SHARED_SETTINGS=(GITLAB_HOST GIT_USER_NAME GIT_USER_EMAIL GIT_SIGN_COMMITS)
+
+# Writes the fleet-wide variables. Changing a value restarts every linked app.
 sync_shared_config() {
-  local id="$1" current desired gh gl
+  local id="$1" current desired var want key
   current="$(cp_read "$id")"
   [ -n "$current" ] || current='[]'
 
-  gh="$GH_TOKEN"; gl="$GITLAB_TOKEN"
-  [ -z "$gh" ] && gh="$(printf '%s' "$current" | jq -r '.[]? | select(.name=="GH_TOKEN") | .value' | head -1)"
-  [ -z "$gl" ] && gl="$(printf '%s' "$current" | jq -r '.[]? | select(.name=="GITLAB_TOKEN") | .value' | head -1)"
+  desired='[]'
+  add_var() {
+    desired="$(printf '%s' "$desired" \
+      | jq --arg n "$1" --arg v "$2" '. + [{name:$n, value:$v}]')"
+  }
 
-  desired="$(jq -n \
-    --arg key   "$(base64 -w0 < "$KEY_PATH")" \
-    --arg gh    "$gh" \
-    --arg gl    "$gl" \
-    --arg host  "$GITLAB_HOST_VALUE" \
-    --arg gname "$GIT_NAME" \
-    --arg gmail "$GIT_EMAIL" \
-    --arg sign  "$SIGN_COMMITS" \
-    '[{name:"VM_AGENT_SSH_KEY_B64",value:$key},
-      {name:"GH_TOKEN",value:$gh},
-      {name:"GITLAB_TOKEN",value:$gl},
-      {name:"GITLAB_HOST",value:$host},
-      {name:"GIT_USER_NAME",value:$gname},
-      {name:"GIT_USER_EMAIL",value:$gmail},
-      {name:"GIT_SIGN_COMMITS",value:$sign}]')"
+  $PER_VM_KEY || add_var VM_AGENT_SSH_KEY_B64 "$(base64 -w0 < "$KEY_PATH")"
 
-  # Per-VM keys cannot live in a shared provider.
-  $PER_VM_KEY && desired="$(printf '%s' "$desired" | jq 'map(select(.name!="VM_AGENT_SSH_KEY_B64"))')"
+  add_var GITLAB_HOST      "$GITLAB_HOST_VALUE"
+  add_var GIT_USER_NAME    "$GIT_NAME"
+  add_var GIT_USER_EMAIL   "$GIT_EMAIL"
+  add_var GIT_SIGN_COMMITS "$SIGN_COMMITS"
+
+  for var in "${SHARED_SECRETS[@]}"; do
+    want="${!var:-}"
+    [ -z "$want" ] && want="$(printf '%s' "$current" \
+      | jq -r --arg n "$var" '.[]? | select(.name==$n) | .value' | head -1)"
+    [ -n "$want" ] && add_var "$var" "$want"
+  done
 
   if [ "$(printf '%s' "$current" | jq -S 'sort_by(.name)')" = "$(printf '%s' "$desired" | jq -S 'sort_by(.name)')" ]; then
-    skip "shared config already up to date"
+    skip "shared config already up to date ($(printf '%s' "$desired" | jq 'length') variables)"
   else
     cp_write "$id" "$desired" >/dev/null
     if [ "$(cp_read "$id" | jq -S 'sort_by(.name)')" = "$(printf '%s' "$desired" | jq -S 'sort_by(.name)')" ]; then
       ok "shared config written ($(printf '%s' "$desired" | jq 'length') variables)"
+      printf '%s' "$desired" | jq -r '.[] | "      \(.name)"'
     else
       die "could not write the shared configuration"
     fi
@@ -171,8 +177,7 @@ sync_shared_config() {
 # the provider now owns must be cleared from the app.
 prune_shadowing_env() {
   local alias="$1" key
-  for key in VM_AGENT_SSH_KEY_B64 GH_TOKEN GITLAB_TOKEN GITLAB_HOST \
-             GIT_USER_NAME GIT_USER_EMAIL GIT_SIGN_COMMITS; do
+  for key in VM_AGENT_SSH_KEY_B64 "${SHARED_SETTINGS[@]}" "${SHARED_SECRETS[@]}"; do
     $PER_VM_KEY && [ "$key" = VM_AGENT_SSH_KEY_B64 ] && continue
     if clever env --format json --alias "$alias" 2>/dev/null \
         | jq -e --arg k "$key" '.env[]? | select(.name==$k)' >/dev/null 2>&1; then
