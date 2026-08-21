@@ -93,6 +93,25 @@ The commit key is installed to `~/.ssh/id_ed25519` at boot, GitHub and
 GitLab host keys are pre-seeded into `~/.ssh/known_hosts`, and `~/.ssh/config`
 pins the key for every host.
 
+### Current state
+
+* **GitLab** — `GITLAB_TOKEN` set, `glab` authenticated as `<forge-user>`. The
+  public key is registered on the account as *vm-agent (Clever Cloud)* with
+  `usage_type=auth_and_signing`, and `GIT_SIGN_COMMITS=true`, so commits
+  made on the box show as Verified.
+* **GitHub** — `GH_TOKEN` is still empty. Set it, then add the same public
+  key at <https://github.com/settings/keys> (as both an authentication and
+  a signing key) for SSH pushes and verified commits.
+
+The public key:
+
+```
+ssh-ed25519 <public key> vm-agent@clever-cloud
+```
+
+`GIT_USER_EMAIL` is `you@example.com` — the only address verified on the
+GitLab account, which is what signature verification matches against.
+
 ## Layout
 
 ```
@@ -120,3 +139,12 @@ clever logs --app vm-agent
 Inside the box, `vm-status` and `vm-log` are aliases for the same thing.
 The boot script never aborts on a failed step: a half-provisioned instance
 you can SSH into is more useful than a dead one.
+
+One quirk worth knowing: the stock `~/.bashrc` stops part-way through in
+*non-interactive* shells, so `clever ssh < script.sh` gets neither the app
+environment nor `~/.local/bin`. Interactive sessions are fine. Scripts
+should start with:
+
+```bash
+. ~/.vm-agent-rc
+```

@@ -58,6 +58,12 @@ configure_git() {
     git config --global gpg.format ssh
     git config --global user.signingkey "$HOME/.ssh/id_ed25519.pub"
     git config --global commit.gpgsign "${GIT_SIGN_COMMITS:-false}"
+
+    # Without an allowed-signers file `git log --show-signature` errors out
+    # locally even though the signature itself is valid on the forge.
+    printf '%s %s\n' "${GIT_USER_EMAIL:-vm-agent@clever-cloud.local}" \
+      "$(cat "$HOME/.ssh/id_ed25519.pub")" > "$HOME/.ssh/allowed_signers"
+    git config --global gpg.ssh.allowedSignersFile "$HOME/.ssh/allowed_signers"
   fi
   log "git identity: $(git config --global user.name) <$(git config --global user.email)>"
 }
