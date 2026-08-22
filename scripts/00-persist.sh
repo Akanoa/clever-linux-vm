@@ -51,6 +51,12 @@ mkdir -p "$VM_ROOT"/{workspace,state} "$PERSIST_ROOT/shared"
 # Live workspace, written straight through to the bucket.
 link_persistent "$VM_ROOT/workspace" "$HOME/workspace"
 
+# Where agents leave results. On the bucket, so it survives redeploys and
+# any VM can read another's output directly; also served over the fleet
+# endpoint, since scraping a terminal loses anything the agent's UI folds
+# away into a collapsed tool result.
+link_persistent "$VM_ROOT/out" "$HOME/out"
+
 # Fleet-wide scratch: visible to every VM. Nothing writes here on its own,
 # it is there for deliberately shared artefacts between boxes.
 link_persistent "$PERSIST_ROOT/shared" "$HOME/shared"

@@ -13,6 +13,9 @@
 #   fleet read <vm>/<agent>          recent terminal output
 #   fleet prompt <vm>/<agent> "..."  submit a prompt
 #   fleet keys <vm>/<agent> esc      send key presses
+#   fleet task <vm>/<agent> "..."    prompt, and collect the answer to a file
+#   fleet fetch <vm>/<agent>         print that file
+#   fleet out <vm>                   list a VM's result files
 #   fleet get <vm> <path>            raw GET against one VM's endpoint
 set -uo pipefail
 
@@ -122,6 +125,25 @@ case "${1:-status}" in
     [ $# -ge 1 ] || die "usage: fleet keys <vm>/<agent> <key>..."
     call POST "$TGT_VM" "/agents/$TGT_AGENT/keys" \
       "$(printf '%s\n' "$@" | jq -Rsc 'split("\n") | map(select(length>0)) | {keys:.}')" | jq . ;;
+  task)
+    split_target "${2:?usage: fleet task <vm>/<agent> \"text\"}"
+    [ $# -ge 3 ] || die 'usage: fleet task <vm>/<agent> "text"'
+    # Agent UIs collapse tool output, so the terminal is not a reliable
+    # transport for results. Ask for the answer as a file instead.
+    out="$TGT_AGENT.md"
+    full="$3
+
+When you are finished, write your complete answer to ~/out/$out (create the
+directory if needed). That file is how it gets collected - the terminal is
+not read. Then print one line: WROTE ~/out/$out"
+    call POST "$TGT_VM" "/agents/$TGT_AGENT/prompt" \
+      "$(jq -nc --arg t "$full" '{text:$t}')" \
+      | jq -r '"submitted; collect with: fleet fetch '"$TGT_VM/$TGT_AGENT"'"' ;;
+  fetch)
+    split_target "${2:?usage: fleet fetch <vm>/<agent> [file]}"
+    call GET "$TGT_VM" "/out/${3:-$TGT_AGENT.md}" ;;
+  out)
+    call GET "${2:?usage: fleet out <vm>}" /out | jq -r '.files[]? | "\(.bytes)\t\(.name)"' ;;
   get)
     call GET "${2:?usage: fleet get <vm> <path>}" "${3:?usage: fleet get <vm> <path>}" ;;
   ls)  vm_names ;;

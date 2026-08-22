@@ -25,6 +25,8 @@ VM_NAME = os.environ.get("VM_AGENT_NAME", "vm-agent")
 FLEET_TOKEN = os.environ.get("VM_AGENT_FLEET_TOKEN", "")
 TOOLS = ["herdr", "claude", "opencode", "codex", "gh", "glab", "git", "s3cmd"]
 MAX_BODY = 64 * 1024
+MAX_OUT = 8 * 1024 * 1024
+OUT_DIR = os.path.expanduser("~/out")
 
 HOME = os.path.expanduser("~")
 SEARCH_PATH = os.pathsep.join([
@@ -228,6 +230,30 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, fh.read(), "text/plain; charset=utf-8")
             except OSError:
                 return self._json(404, {"error": "no boot log yet"})
+
+        if parts == ["out"]:
+            try:
+                names = sorted(n for n in os.listdir(OUT_DIR)
+                               if os.path.isfile(os.path.join(OUT_DIR, n)))
+            except OSError:
+                names = []
+            return self._json(200, {"vm": VM_NAME, "files": [
+                {"name": n, "bytes": os.path.getsize(os.path.join(OUT_DIR, n))}
+                for n in names]})
+
+        if len(parts) == 2 and parts[0] == "out":
+            # Basename only: no traversal out of the drop directory.
+            name = os.path.basename(parts[1])
+            if not name or name.startswith("."):
+                return self._json(400, {"error": "bad file name"})
+            path = os.path.join(OUT_DIR, name)
+            if not os.path.isfile(path):
+                return self._json(404, {"error": f"no such output: {name}"})
+            if os.path.getsize(path) > MAX_OUT:
+                return self._json(413, {"error": "output too large",
+                                        "bytes": os.path.getsize(path)})
+            with open(path, "rb") as fh:
+                return self._send(200, fh.read(), "text/plain; charset=utf-8")
 
         if parts == ["agents"]:
             return self._json(*herdr("agent", "list"))
