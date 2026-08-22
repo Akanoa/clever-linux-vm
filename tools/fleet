@@ -10,7 +10,8 @@
 #   fleet status                     one line per VM
 #   fleet start <vm> <name> [kind]   launch an agent in a fresh pane
 #   fleet agents                     every agent on every box
-#   fleet read <vm>/<agent>          recent terminal output
+#   fleet read <vm>/<agent> [-f]     recent terminal output (-f to follow)
+#   fleet attach <vm>/<agent>        open that agent's terminal in your terminal
 #   fleet prompt <vm>/<agent> "..."  submit a prompt
 #   fleet keys <vm>/<agent> esc      send key presses
 #   fleet task <vm>/<agent> "..."    prompt, and collect the answer to a file
@@ -111,9 +112,55 @@ case "${1:-status}" in
     call POST "$vm" /agents "$body" \
       | jq '{started, pane, status: .agent.agent_status, ready: .agent.interactive_ready, hint}' ;;
   read)
-    split_target "${2:?usage: fleet read <vm>/<agent>}"
-    call GET "$TGT_VM" "/agents/$TGT_AGENT/read?source=${3:-recent}" \
-      | jq -r '.result.output // .output // .' ;;
+    split_target "${2:?usage: fleet read <vm>/<agent> [-f]}"
+    follow=false; source=recent
+    for a in "${@:3}"; do
+      case "$a" in
+        -f|--follow) follow=true ;;
+        visible|recent|recent-unwrapped|detection) source="$a" ;;
+      esac
+    done
+    fetch_read() {
+      call GET "$TGT_VM" "/agents/$TGT_AGENT/read?source=$source" \
+        | jq -r '.result.output // .output // .'
+    }
+    if ! $follow; then fetch_read; exit 0; fi
+    # A terminal read is a screen snapshot, not an append-only log, so this
+    # re-renders rather than tailing - closer to `watch` than `tail -f`.
+    trap 'printf "\033[?25h\n"; exit 0' INT TERM
+    printf '\033[?25l'
+    while true; do
+      out="$(fetch_read)"
+      st="$(call GET "$TGT_VM" "/agents/$TGT_AGENT" | jq -r '.result.agent.agent_status // "?"')"
+      printf '\033[H\033[2J'
+      printf '%s%s/%s  [%s]  refreshing every %ss - ctrl+c to stop%s\n\n' \
+        "$c_dim" "$TGT_VM" "$TGT_AGENT" "$st" "${FLEET_FOLLOW_INTERVAL:-5}" "$c_off"
+      printf '%s\n' "$out" | tail -n $(( ${LINES:-40} - 4 ))
+      sleep "${FLEET_FOLLOW_INTERVAL:-5}"
+    done ;;
+  attach)
+    # herdr has no federation (`--remote` accepts one target only), so the
+    # agent's terminal has to be attached on the VM that owns it. tmux runs
+    # on its own socket with prefix ctrl+a, leaving ctrl+b for herdr.
+    split_target "${2:?usage: fleet attach <vm>/<agent>}"
+    command -v tmux >/dev/null || die "tmux is required for attach"
+    command -v clever >/dev/null || die "clever is required for attach"
+    sock="fleet-attach"; sess="$TGT_VM-$TGT_AGENT"
+    tmux -L "$sock" kill-session -t "$sess" 2>/dev/null
+    tmux -L "$sock" new-session -d -s "$sess" "clever ssh --alias '$TGT_VM'"
+    tmux -L "$sock" set-option -g prefix C-a
+    tmux -L "$sock" unbind-key C-b
+    tmux -L "$sock" bind-key C-a send-prefix
+    printf '%s\n' "$c_dim  connecting to $TGT_VM…$c_off"
+    for _ in $(seq 1 40); do
+      tmux -L "$sock" capture-pane -p -t "$sess" 2>/dev/null \
+        | grep -qE 'bas@[0-9a-f-]+ +.*\$ *$' && break
+      sleep 1
+    done
+    tmux -L "$sock" send-keys -t "$sess" "herdr agent attach $TGT_AGENT" Enter
+    printf '%s\n' "$c_dim  tmux prefix is ctrl+a (ctrl+b goes to herdr); ctrl+a d to detach$c_off"
+    sleep 1
+    exec tmux -L "$sock" attach-session -t "$sess" ;;
   prompt)
     split_target "${2:?usage: fleet prompt <vm>/<agent> \"text\"}"
     [ $# -ge 3 ] || die 'usage: fleet prompt <vm>/<agent> "text"'
