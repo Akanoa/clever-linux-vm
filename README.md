@@ -13,6 +13,31 @@ working while nobody is attached.
 | Instances | pinned to 1 per app — scale out by adding VMs, not instances |
 | Health | `https://app-<id>.cleverapps.io/status` — `./provision.sh --list` prints the real URLs |
 
+## Quick start
+
+`new-fleet.sh` is the guided path from nothing to a running fleet. It asks
+for a fleet name, your commit identity, the agent and forge tokens and how
+many VMs you want; validates the GitHub and GitLab tokens against their
+APIs before you find out the hard way; writes `fleet.conf` and
+`.secrets/tokens.env`; generates the commit key and registers it on your
+forges; then hands over to `provision.sh`.
+
+```bash
+./new-fleet.sh              # ask, confirm, build
+./new-fleet.sh --no-deploy  # same, but skip the code deploy
+```
+
+Nothing is created until you confirm the summary, and every question
+defaults to your current answer — so re-running it is also how you
+reconfigure a fleet. The rest of this README is what it does for you, and
+what to reach for once the fleet exists.
+
+Naming the fleet matters if you want more than one: the three shared
+add-ons are looked up by name, so `acme` gives you `acme-config`,
+`acme-cellar` and `acme-fs`, separate from any other fleet in the same
+organisation. `vms.txt` still tracks one fleet per checkout, so a second
+fleet wants a second clone.
+
 ## Provisioning a VM
 
 `provision.sh` is idempotent: every step checks the desired state before
@@ -110,6 +135,9 @@ publish.
 
 `agent-tokens.sh` fills `.secrets/tokens.env`; `provision.sh` pushes it to
 the config provider, and every linked VM restarts with the new value.
+
+`./new-fleet.sh` collects all of these on a first run; `agent-tokens.sh`
+is the way to change one afterwards.
 
 ```bash
 ./agent-tokens.sh                      # what is set, masked
@@ -361,6 +389,7 @@ scripts/40-herdr.sh        starts the headless herdr server
 tools/cellar               s3cmd wrapper for the Cellar bucket
 tools/vm-snapshot          agent state -> FS Bucket
 tools/fleet                talk to the other VMs (runs on VM and laptop)
+new-fleet.sh               interactive first-run wizard (runs locally)
 provision.sh               idempotent fleet provisioner (runs locally)
 agent-tokens.sh            fills .secrets/tokens.env (runs locally)
 fleet.conf.example         template for fleet.conf (gitignored)
