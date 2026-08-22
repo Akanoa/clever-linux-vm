@@ -246,7 +246,7 @@ while :; do
   case "$AGENT_COUNT" in
     ''|*[!0-9]*) warn "that is not a number" ;;
     0)           warn "a fleet needs at least one agent" ;;
-    *)           [ "$AGENT_COUNT" -gt 20 ] && { warn "$AGENT_COUNT agents is a lot - $AGENT_COUNT applications billed by the hour"
+    *)           [ "$AGENT_COUNT" -gt 20 ] && { warn "$AGENT_COUNT agents is a lot - that is $AGENT_COUNT separate applications"
                    ask_yn "really?" n || continue; }
                  break ;;
   esac
@@ -378,8 +378,9 @@ printf '  %-22s %s\n' "GitHub"          "$([ -n "$GH_TOK" ] && echo "${GH_LOGIN:
 printf '  %-22s %s\n' "GitLab"          "$([ -n "$GL_TOK" ] && echo "${GL_LOGIN:-token stored} on $GITLAB_HOST" || echo '— none')"
 printf '  %-22s %s\n' "shared add-ons"  "$CONFIG_ADDON, $CELLAR_ADDON, $FS_ADDON"
 printf '\n'
-note "$AGENT_COUNT application(s) billed by the hour, plus one Cellar and one"
-note "FS Bucket add-on. Nothing has been created yet."
+note "$AGENT_COUNT application(s), plus one Cellar and one FS Bucket add-on,"
+note "charged according to $([ -n "${ORG_LABEL:-}" ] && printf '%s' "$ORG_LABEL" || printf 'your organisation')'s plan."
+note "Nothing has been created yet."
 printf '\n'
 ask_yn "write this configuration and build the fleet?" y || die "nothing was written"
 
@@ -536,5 +537,5 @@ hdr "fleet ready"
 note "./tools/fleet status                 who is up"
 note "./tools/fleet start <vm> <name>      launch an agent"
 note "./tools/fleet attach <vm>/<name>     drive it in herdr"
-note "./provision.sh --destroy --all --yes stop billing"
+note "./provision.sh --destroy --all --yes tear the fleet down"
 printf '\n'

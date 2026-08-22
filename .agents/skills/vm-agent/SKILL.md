@@ -17,8 +17,26 @@ Use this skill to **delegate work that outlives a session**: a migration
 that takes hours, several independent tasks in parallel, anything that
 should survive your own context running out.
 
-Do not use it for work you can finish locally. Each VM is a billed
-application; a fleet left running costs money whether or not it is busy.
+## Ask what the organisation costs before creating anything
+
+Each VM is a separate Clever Cloud application. What that costs depends
+entirely on the organisation it lands in — some carry free-tier credits, a
+sponsorship or an open-source plan; others are billed by the hour. **The
+API will not tell you which**, and guessing wrong in either direction is
+unhelpful: nagging about cost on a covered organisation is noise, and
+quietly starting eight VMs on a billed one is worse.
+
+So ask, once, before the first VM:
+
+> Is `<org>` on a free tier or covered by credits, or is it billed?
+
+* **Covered** — size and count are a technical decision. Run as many
+  agents as the work actually wants, and leave them up between sessions.
+* **Billed** — say what you are about to create before creating it, prefer
+  fewer and smaller VMs, and offer teardown once the work is collected.
+
+Either way, never scale a fleet up silently. And if the work fits in the
+session you are already in, just do it here.
 
 ## Where you are matters
 
@@ -133,9 +151,13 @@ by `fleet fetch`. Use `task`/`fetch` whenever you need the output.
 
 ## Tearing down
 
-VMs bill by the hour. Destroying the applications leaves the Cellar
-bucket, the FS Bucket and the config provider running — they are
-fleet-wide, so no single teardown may take them.
+Whether idle VMs cost anything depends on the organisation — see above.
+On a billed one, offer teardown once results are collected; on a covered
+one, leaving the fleet up is usually what the user wants.
+
+Destroying the applications leaves the Cellar bucket, the FS Bucket and
+the config provider running — they are fleet-wide, so no single teardown
+may take them.
 
 ```bash
 ./provision.sh --destroy agent-3 --yes           # one VM
