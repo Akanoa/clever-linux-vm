@@ -35,12 +35,21 @@ moerae get -p PROJECT <node_id>                           # full content
 moerae stats -p PROJECT
 \`\`\`
 
-**The one thing to get right:** every \`put\` *without* \`-c\` starts a new
-conversation, and a \`search\` without \`-c\` only looks at the newest one. Keep
-the conversation id from your first \`put\` and pass it to every later \`put\`
-and \`search\`, or your memory is write-only. \`--project-scope\` searches across
-conversations, but only reaches segments that have been promoted, so it is
-not a substitute early on.
+**The conversation id is everything.** Every \`put\` *without* \`-c\` starts a new
+conversation, and a \`search\` without \`-c\` only looks at the newest one.
+Measured on this box: for a young conversation, both a bare \`search\` and
+\`--project-scope\` return **zero rows and exit 0** - no error, just silence.
+So:
+
+- Save the conversation id the moment the first \`put\` returns it. Write it
+  into a file under \`~/workspace\`, not just shell history.
+- If you lose it, \`moerae convs -p PROJECT\` lists the ids - that is the only
+  way back to your own memory.
+
+**Run one \`put\` per shell command.** Chaining several in a single invocation
+was observed to fail partway with exit 1 and *no output*, after the first
+one had already written - which silently duplicates nodes. Keep puts under
+a few hundred characters, and check \`\$?\`: failures here are silent.
 
 Use \`-p\` per project/repo. First use downloads a ~300MB embedding model
 (~12s); the model is deliberately not persisted, the memory is.
