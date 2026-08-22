@@ -22,6 +22,9 @@ SYNC_DIRS=(
   "glab:$HOME/.config/glab-cli"
 )
 EXCLUDES=(--exclude='*.sock' --exclude='*.lock' --exclude='*.log' --exclude='.plugins.lock')
+SYNC_FILES=(
+  "claude.json:$HOME/.claude.json"
+)
 
 snapshot() {
   local name path dst
@@ -31,6 +34,14 @@ snapshot() {
     mkdir -p "$dst"
     rsync -a --delete "${EXCLUDES[@]}" "$path/" "$dst/" 2>/dev/null \
       || echo "vm-snapshot: failed to sync $name" >&2
+  done
+  local fname fpath
+  mkdir -p "$VM_ROOT/state/files"
+  for entry in "${SYNC_FILES[@]}"; do
+    fname="${entry%%:*}"; fpath="${entry#*:}"
+    [ -f "$fpath" ] || continue
+    cp -a "$fpath" "$VM_ROOT/state/files/$fname" 2>/dev/null \
+      || echo "vm-snapshot: failed to save $fname" >&2
   done
   date -u +'%Y-%m-%dT%H:%M:%SZ' > "$VM_ROOT/state/.last-snapshot" 2>/dev/null
 }

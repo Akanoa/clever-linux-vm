@@ -20,6 +20,40 @@ export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
 # Masked, so a token never reaches the platform log.
 mask() { local v="$1"; [ -n "$v" ] && printf '%s…%s (%d chars)' "${v:0:6}" "${v: -4}" "${#v}" || printf 'unset'; }
 
+# Claude Code keeps first-run state in ~/.claude.json, separate from the
+# ~/.claude directory. Without it the TUI stops at the login selector even
+# when CLAUDE_CODE_OAUTH_TOKEN is set and headless `claude -p` works fine -
+# which is exactly what blocks an agent launched into a herdr pane.
+seed_claude_onboarding() {
+  [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}${ANTHROPIC_API_KEY:-}" ] || return 0
+  local version
+  version="$(claude --version 2>/dev/null | awk '{print $1}')"
+  CLAUDE_JSON="$HOME/.claude.json" CLAUDE_VERSION="$version" python3 - <<'PYEOF'
+import json, os
+
+path = os.environ["CLAUDE_JSON"]
+version = os.environ.get("CLAUDE_VERSION") or "0.0.0"
+try:
+    with open(path) as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        data = {}
+except (OSError, ValueError):
+    data = {}
+
+if data.get("hasCompletedOnboarding") is True:
+    print("claude: onboarding already marked complete")
+else:
+    data["hasCompletedOnboarding"] = True
+    data.setdefault("lastOnboardingVersion", version)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, path)
+    print("claude: marked onboarding complete so the TUI starts ready")
+PYEOF
+}
+
 claude_auth() {
   if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
     log "claude: long-lived subscription token $(mask "$CLAUDE_CODE_OAUTH_TOKEN")"
@@ -67,6 +101,7 @@ opencode_auth() {
   fi
 }
 
+seed_claude_onboarding 2>&1 | sed 's/^/[vm-agent] /' || true
 claude_auth   || true
 codex_auth    || true
 opencode_auth || true

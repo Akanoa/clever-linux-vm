@@ -31,6 +31,12 @@ SYNC_DIRS=(
   "gh:$HOME/.config/gh"
   "glab:$HOME/.config/glab-cli"
 )
+# Single files that matter as much as the directories: ~/.claude.json holds
+# Claude Code's onboarding and per-project trust state.
+SYNC_FILES=(
+  "claude.json:$HOME/.claude.json"
+)
+
 # Sockets and logs are per-boot; restoring them confuses herdr on startup.
 SYNC_EXCLUDES=(--exclude='*.sock' --exclude='*.lock' --exclude='*.log' --exclude='.plugins.lock')
 
@@ -60,6 +66,16 @@ restore_state() {
   done
 }
 
+restore_files() {
+  local name path src
+  for entry in "${SYNC_FILES[@]}"; do
+    name="${entry%%:*}"; path="${entry#*:}"; src="$VM_ROOT/state/files/$name"
+    [ -f "$src" ] || continue
+    cp -a "$src" "$path" 2>/dev/null && log "restored $name -> $path"
+  done
+}
+
 restore_state
+restore_files
 log "shared bucket: $PERSIST_ROOT ($(df -h "$PERSIST_ROOT" 2>/dev/null | awk 'NR==2{print $2" total, "$4" free"}'))"
 log "this VM's subtree: vms/${VM_AGENT_NAME:-default}"
