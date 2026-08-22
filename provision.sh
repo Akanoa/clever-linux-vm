@@ -187,12 +187,31 @@ build_fleet_roster() {
 # standing in front of it. Minted once, then carried by the provider.
 ensure_fleet_token() {
   local current="$1"
-  if [ -n "$current" ]; then
-    skip "fleet token already minted"
+  # Log to stderr: this function's stdout *is* the token. Also validate the
+  # shape, so a value corrupted by a stray log line heals itself instead of
+  # silently becoming the fleet's shared secret.
+  if printf '%s' "$current" | grep -qE '^[0-9a-f]{64}$'; then
+    skip "fleet token already minted" >&2
     printf '%s' "$current"
   else
-    ok "minted a new fleet token"
-    openssl rand -hex 32
+    [ -n "$current" ] && say "stored fleet token is malformed - reminting" >&2
+    local minted
+    minted="$(mint_token)"
+    printf '%s' "$minted" | grep -qE '^[0-9a-f]{64}$' \
+      || die "could not generate a fleet token"
+    ok "minted a new fleet token" >&2
+    printf '%s' "$minted"
+  fi
+}
+
+# /dev/urandom rather than `openssl rand`: openssl is not guaranteed to be
+# present or working (a mismatched libssl exits 0 and prints nothing, which
+# would hand the fleet an empty shared secret).
+mint_token() {
+  if [ -r /dev/urandom ]; then
+    od -An -tx1 -N32 /dev/urandom | tr -d ' \n'
+  else
+    python3 -c 'import secrets; print(secrets.token_hex(32))' 2>/dev/null
   fi
 }
 
