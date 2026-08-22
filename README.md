@@ -94,6 +94,11 @@ environment. **An empty local token never blanks one already in the
 provider** — it is read back and kept, so running `--all` without secrets
 in your shell is safe.
 
+**Deploying restarts every VM**, which destroys herdr panes and kills
+whatever agents were mid-task — a write to the shared config does the same,
+since Clever Cloud restarts linked apps on change. `provision.sh` refuses
+when any agent is `working` or `blocked`; `--force` overrides.
+
 `--destroy` removes an app and its own two add-ons, never the shared
 provider.
 

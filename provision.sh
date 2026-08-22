@@ -15,6 +15,7 @@
 #   ./provision.sh agent --count 4           agent-1 .. agent-4
 #   ./provision.sh --all                     re-apply to every VM in vms.txt
 #   ./provision.sh --list                    show the fleet
+#   --force                                  deploy even if agents are working
 #   ./provision.sh --all --forget OPENAI_API_KEY   drop a shared secret
 #   ./provision.sh --destroy agent-3 --yes   tear one down
 set -uo pipefail
@@ -44,6 +45,7 @@ CELLAR_ADDON="${CELLAR_ADDON:-vm-agent-cellar}"
 CELLAR_BUCKET_NAME="${CELLAR_BUCKET_NAME:-}"
 FS_ADDON="${FS_ADDON:-vm-agent-fs}"
 FORGET=()
+FORCE=false
 GIT_NAME="${GIT_USER_NAME:-vm-agent}"
 GIT_EMAIL="${GIT_USER_EMAIL:-vm-agent@clever-cloud.local}"
 SIGN_COMMITS="${GIT_SIGN_COMMITS:-false}"
@@ -215,6 +217,35 @@ mint_token() {
   else
     python3 -c 'import secrets; print(secrets.token_hex(32))' 2>/dev/null
   fi
+}
+
+# Deploying, and any write to the shared config, restarts every linked app
+# - which destroys every herdr pane and kills whatever the agents were in
+# the middle of. Nothing warned about that, and it has silently thrown away
+# work more than once, so check before doing it.
+busy_agents() {
+  local env_file="$SECRETS_DIR/fleet.env" roster token vm url busy out
+  [ -f "$env_file" ] || return 0
+  roster="$(sed -n 's/^export VM_AGENT_FLEET="\(.*\)"$/\1/p' "$env_file" | tail -1)"
+  token="$(sed -n 's/^export VM_AGENT_FLEET_TOKEN="\(.*\)"$/\1/p' "$env_file" | tail -1)"
+  [ -n "$roster" ] && [ -n "$token" ] || return 0
+
+  busy=""
+  for entry in $(printf '%s' "$roster" | tr ',' ' '); do
+    vm="${entry%%=*}"; url="${entry#*=}"
+    out="$(curl -sS --max-time 10 "$url/agents" -H "Authorization: Bearer $token" 2>/dev/null)" || continue
+    printf '%s' "$out" | jq -e '.result.agents' >/dev/null 2>&1 || continue
+    while read -r a; do
+      [ -n "$a" ] && busy="${busy:+$busy }$vm/$a"
+    done < <(printf '%s' "$out" | jq -r '.result.agents[]?
+             | select(.agent_status=="working" or .agent_status=="blocked")
+             | .name // .pane_id')
+  done
+  [ -z "$busy" ] && return 0
+  printf '%s\n' "$c_err  ! agents are mid-task: $busy$c_off" >&2
+  printf '%s\n' "$c_err    deploying restarts every VM and destroys their panes.$c_off" >&2
+  printf '%s\n' "$c_err    wait, or re-run with --force to kill them anyway.$c_off" >&2
+  return 1
 }
 
 # ---------------------------------------------------- shared config
@@ -536,6 +567,7 @@ while [ $# -gt 0 ]; do
     --list)     ACTION="list"; shift ;;
     --destroy)  ACTION="destroy"; NAMES+=("$2"); shift 2 ;;
     --yes|-y)   CONFIRMED=true; shift ;;
+    --force)    FORCE=true; shift ;;
     -h|--help)  usage ;;
     -*)         die "unknown option: $1" ;;
     *)          NAMES+=("$1"); shift ;;
@@ -550,6 +582,8 @@ case "$ACTION" in
   all|provision)
     [ "$ACTION" = all ] && { [ -s "$FLEET_FILE" ] || die "vms.txt is empty - provision a VM first"; }
     [ "$ACTION" = provision ] && [ "${#NAMES[@]}" -eq 0 ] && usage 1
+
+    if ! $FORCE; then busy_agents || die "aborted to protect running agents"; fi
 
     hdr "shared resources"
     $PER_VM_KEY || ensure_key "$KEY_PATH"
