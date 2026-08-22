@@ -428,6 +428,7 @@ scripts/40-herdr.sh        starts the headless herdr server
 tools/cellar               s3cmd wrapper for the Cellar bucket
 tools/vm-snapshot          agent state -> FS Bucket
 tools/fleet                talk to the other VMs (runs on VM and laptop)
+.agents/skills/vm-agent/   SKILL.md: how another agent drives this fleet
 new-fleet.sh               interactive first-run wizard (runs locally)
 provision.sh               idempotent fleet provisioner (runs locally)
 agent-tokens.sh            fills .secrets/tokens.env (runs locally)
@@ -435,6 +436,14 @@ fleet.conf.example         template for fleet.conf (gitignored)
 connect.sh                 local helper: ssh / herdr attach
 vms.txt                    fleet registry (gitignored)
 ```
+
+## Using this from another agent
+
+`.agents/skills/vm-agent/SKILL.md` packages the repository as a skill, so
+an agent can provision a fleet and delegate work to it without reading
+this README. It covers what to run, how to collect results as files rather
+than off the terminal, and the constraints that bite — including that
+`new-fleet.sh` needs a real terminal and has to be handed back to a human.
 
 ## Debugging
 

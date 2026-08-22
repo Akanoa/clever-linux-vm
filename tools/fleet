@@ -39,6 +39,15 @@ SELF="${VM_AGENT_NAME:-}"
 c_ok=$'\033[32m'; c_dim=$'\033[2m'; c_err=$'\033[31m'; c_off=$'\033[0m'
 die() { printf '%s%s%s\n' "$c_err" "fleet: $*" "$c_off" >&2; exit 1; }
 
+# Before the roster checks: asking what this command does must work on a
+# machine that has no fleet yet. Print the whole leading comment, not a
+# fixed line range - that silently drops the last options as soon as
+# anyone adds one.
+if [ "${1:-}" = -h ] || [ "${1:-}" = --help ]; then
+  awk 'NR > 1 { if (/^#/) { sub(/^# ?/, ""); print } else { exit } }' "$0"
+  exit 0
+fi
+
 if [ -n "$shell_fleet" ] && [ "$shell_fleet" != "$FLEET" ]; then
   printf '%s%s%s\n' "$c_dim" \
     "fleet: your exported VM_AGENT_FLEET is stale - using .secrets/fleet.env" "$c_off" >&2
@@ -226,6 +235,5 @@ not read. Then print one line: WROTE ~/out/$out"
   get)
     call GET "${2:?usage: fleet get <vm> <path>}" "${3:?usage: fleet get <vm> <path>}" ;;
   ls)  vm_names ;;
-  -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
   *)   die "unknown command: $1 (try --help)" ;;
 esac
