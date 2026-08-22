@@ -142,6 +142,27 @@ restarts. `/status` reports what each agent found:
 "agent_auth": { "claude": "subscription-token", "codex": null, "opencode": ["anthropic"] }
 ```
 
+## Demo
+
+`demo.sh` provisions a VM, sets the fleet to run agents unattended, and
+opens a two-pane layout: control on the left, the remote herdr UI on the
+right.
+
+```bash
+./demo.sh start [vm-name]    # provision if needed, then open the layout
+./demo.sh layout [vm-name]   # just open the layout
+./demo.sh stop [vm-name]     # destroy the VM, restore the permission mode
+```
+
+It edits nothing: tmux runs on its own socket with its own prefix, so your
+`~/.tmux.conf` is untouched, and the permission mode is passed as an
+environment override that `fleet.conf`'s `: "${VAR:=default}"` already
+honours.
+
+The prefix matters — **both herdr instances bind `ctrl+b`**, so the demo
+tmux uses `ctrl+a` and leaves `ctrl+b` to the remote herdr on the right.
+Detach the whole thing with `ctrl+a d`.
+
 ## Fleet federation
 
 herdr has no federation — `herdr --remote` errors with *"can only be
