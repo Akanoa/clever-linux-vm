@@ -11,7 +11,7 @@
 # rotated in a single place and the public key is registered on the forges
 # only once.
 #
-#   ./provision.sh web-agent                 create or update one VM
+#   ./provision.sh web-agent                 create or update one VM named 'web-agent'
 #   ./provision.sh agent --count 4           agent-1 .. agent-4
 #   ./provision.sh --all                     re-apply to every VM in vms.txt
 #   ./provision.sh --list                    show the fleet
