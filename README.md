@@ -177,7 +177,7 @@ fleet agents                       # every agent on every box
 fleet start <vm> <name> [kind]     # launch an agent in a fresh pane
 fleet prompt <vm>/<name> "..."     # submit a prompt
 fleet read <vm>/<name> [-f]        # recent terminal output, -f to follow
-fleet attach <vm>/<name>           # open that agent's terminal locally
+fleet attach <vm>[/<name>]         # attach the remote herdr UI, focusing that agent
 fleet keys <vm>/<name> 1           # answer a prompt the agent is blocked on
 fleet task <vm>/<name> "..."       # prompt, and collect the answer to a file
 fleet fetch <vm>/<name>            # print that file

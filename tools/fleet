@@ -11,7 +11,7 @@
 #   fleet start <vm> <name> [kind]   launch an agent in a fresh pane
 #   fleet agents                     every agent on every box
 #   fleet read <vm>/<agent> [-f]     recent terminal output (-f to follow)
-#   fleet attach <vm>/<agent>        open that agent's terminal in your terminal
+#   fleet attach <vm>[/<agent>]      attach the remote herdr UI (focus that agent)
 #   fleet prompt <vm>/<agent> "..."  submit a prompt
 #   fleet keys <vm>/<agent> esc      send key presses
 #   fleet task <vm>/<agent> "..."    prompt, and collect the answer to a file
@@ -142,10 +142,17 @@ case "${1:-status}" in
     # herdr has no federation (`--remote` accepts one target only), so the
     # agent's terminal has to be attached on the VM that owns it. tmux runs
     # on its own socket with prefix ctrl+a, leaving ctrl+b for herdr.
-    split_target "${2:?usage: fleet attach <vm>/<agent>}"
+    # <vm> alone attaches the whole remote session; <vm>/<agent> focuses
+    # that agent's pane first. Either way you get herdr's full UI, not a
+    # bare terminal - `herdr agent attach` hands over one terminal with no
+    # multiplexer around it, which is rarely what you want.
+    case "${2:?usage: fleet attach <vm>[/<agent>]}" in
+      */*) split_target "$2" ;;
+      *)   TGT_VM="$2"; TGT_AGENT="" ;;
+    esac
     command -v tmux >/dev/null || die "tmux is required for attach"
     command -v clever >/dev/null || die "clever is required for attach"
-    sock="fleet-attach"; sess="$TGT_VM-$TGT_AGENT"
+    sock="fleet-attach"; sess="$TGT_VM${TGT_AGENT:+-$TGT_AGENT}"
     tmux -L "$sock" kill-session -t "$sess" 2>/dev/null
     tmux -L "$sock" new-session -d -s "$sess" "clever ssh --alias '$TGT_VM'"
     tmux -L "$sock" set-option -g prefix C-a
@@ -157,7 +164,13 @@ case "${1:-status}" in
         | grep -qE 'bas@[0-9a-f-]+ +.*\$ *$' && break
       sleep 1
     done
-    tmux -L "$sock" send-keys -t "$sess" "herdr agent attach $TGT_AGENT" Enter
+    # Focus the pane first if one was named, then open the full herdr UI.
+    if [ -n "$TGT_AGENT" ]; then
+      tmux -L "$sock" send-keys -t "$sess" \
+        "herdr agent focus $TGT_AGENT >/dev/null 2>&1; herdr" Enter
+    else
+      tmux -L "$sock" send-keys -t "$sess" "herdr" Enter
+    fi
     printf '%s\n' "$c_dim  tmux prefix is ctrl+a (ctrl+b goes to herdr); ctrl+a d to detach$c_off"
     sleep 1
     exec tmux -L "$sock" attach-session -t "$sess" ;;
