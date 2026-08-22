@@ -524,7 +524,18 @@ do_destroy() {
   else
     skip "application $name does not exist"
   fi
-  [ -f "$FLEET_FILE" ] && { grep -vxF -- "$name" "$FLEET_FILE" > "$FLEET_FILE.tmp" || true; mv "$FLEET_FILE.tmp" "$FLEET_FILE"; }
+  # Only replace the registry if grep actually succeeded or found no match
+  # (exit 1). Any other failure once truncated vms.txt to nothing.
+  if [ -f "$FLEET_FILE" ]; then
+    if grep -vxF -- "$name" "$FLEET_FILE" > "$FLEET_FILE.tmp"; then
+      mv "$FLEET_FILE.tmp" "$FLEET_FILE"
+    elif [ "$?" = "1" ] && [ ! -s "$FLEET_FILE.tmp" ]; then
+      : > "$FLEET_FILE"; rm -f "$FLEET_FILE.tmp"   # last entry removed
+    else
+      rm -f "$FLEET_FILE.tmp"
+      say "left vms.txt untouched - could not rewrite it safely"
+    fi
+  fi
 }
 
 # So `tools/fleet` works from the laptop too, not just from a VM where the
