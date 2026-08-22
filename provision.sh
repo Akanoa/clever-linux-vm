@@ -16,6 +16,7 @@
 #   ./provision.sh --all                     re-apply to every VM in vms.txt
 #   ./provision.sh --list                    show the fleet
 #   ./provision.sh --destroy agent-3 --yes   tear one down
+#   ./provision.sh --destroy --all --yes     tear the whole fleet down
 #   ./provision.sh --all --forget OPENAI_API_KEY   drop a shared secret
 #
 #   --force   deploy even while agents are working (kills their panes)
@@ -47,6 +48,7 @@ CELLAR_BUCKET_NAME="${CELLAR_BUCKET_NAME:-}"
 FS_ADDON="${FS_ADDON:-vm-agent-fs}"
 FORGET=()
 FORCE=false
+DESTROY_ALL=false
 GIT_NAME="${GIT_USER_NAME:-vm-agent}"
 GIT_EMAIL="${GIT_USER_EMAIL:-vm-agent@clever-cloud.local}"
 SIGN_COMMITS="${GIT_SIGN_COMMITS:-false}"
@@ -522,7 +524,7 @@ do_destroy() {
   else
     skip "application $name does not exist"
   fi
-  [ -f "$FLEET_FILE" ] && { grep -vxF "$name" "$FLEET_FILE" > "$FLEET_FILE.tmp" || true; mv "$FLEET_FILE.tmp" "$FLEET_FILE"; }
+  [ -f "$FLEET_FILE" ] && { grep -vxF -- "$name" "$FLEET_FILE" > "$FLEET_FILE.tmp" || true; mv "$FLEET_FILE.tmp" "$FLEET_FILE"; }
 }
 
 # So `tools/fleet` works from the laptop too, not just from a VM where the
@@ -571,7 +573,14 @@ while [ $# -gt 0 ]; do
     --no-deploy)  DEPLOY=false; shift ;;
     --all)      ACTION="all"; shift ;;
     --list)     ACTION="list"; shift ;;
-    --destroy)  ACTION="destroy"; NAMES+=("$2"); shift 2 ;;
+    --destroy)
+                ACTION="destroy"
+                case "${2:-}" in
+                  --all)  DESTROY_ALL=true; shift 2 ;;
+                  # Do not silently treat a flag as a VM name.
+                  -*|"")  die "--destroy needs a VM name, or --all for the whole fleet" ;;
+                  *)      NAMES+=("$2"); shift 2 ;;
+                esac ;;
     --yes|-y)   CONFIRMED=true; shift ;;
     --force)    FORCE=true; shift ;;
     -h|--help)  usage ;;
@@ -584,7 +593,17 @@ clever profile >/dev/null 2>&1 || die "not logged in - run 'clever login' first"
 
 case "$ACTION" in
   list)    do_list ;;
-  destroy) do_destroy "${NAMES[0]}" "$CONFIRMED" ;;
+  destroy)
+    if $DESTROY_ALL; then
+      $CONFIRMED || die "refusing to destroy the whole fleet without --yes"
+      [ -s "$FLEET_FILE" ] || die "vms.txt is empty - nothing to destroy"
+      # Snapshot the list: do_destroy rewrites vms.txt as it goes, so
+      # iterating the file directly would skip entries.
+      mapfile -t victims < "$FLEET_FILE"
+      for n in "${victims[@]}"; do [ -n "$n" ] && do_destroy "$n" true; done
+    else
+      do_destroy "${NAMES[0]}" "$CONFIRMED"
+    fi ;;
   all|provision)
     [ "$ACTION" = all ] && { [ -s "$FLEET_FILE" ] || die "vms.txt is empty - provision a VM first"; }
     [ "$ACTION" = provision ] && [ "${#NAMES[@]}" -eq 0 ] && usage 1
