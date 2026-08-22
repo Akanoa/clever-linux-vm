@@ -28,7 +28,8 @@ seed_claude_onboarding() {
   [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}${ANTHROPIC_API_KEY:-}" ] || return 0
   local version
   version="$(claude --version 2>/dev/null | awk '{print $1}')"
-  CLAUDE_JSON="$HOME/.claude.json" CLAUDE_VERSION="$version" python3 - <<'PYEOF'
+  CLAUDE_JSON="$HOME/.claude.json" CLAUDE_VERSION="$version" \
+  CLAUDE_TRUST_DIRS="$HOME/workspace:$APP_HOME" python3 - <<'PYEOF'
 import json, os
 
 path = os.environ["CLAUDE_JSON"]
@@ -41,16 +42,39 @@ try:
 except (OSError, ValueError):
     data = {}
 
-if data.get("hasCompletedOnboarding") is True:
-    print("claude: onboarding already marked complete")
-else:
+changed = []
+if data.get("hasCompletedOnboarding") is not True:
     data["hasCompletedOnboarding"] = True
     data.setdefault("lastOnboardingVersion", version)
+    changed.append("onboarding")
+
+# The folder-trust prompt is the second thing that blocks a pane agent.
+# Trusting the VM's own workspace is safe: it is the box's whole purpose,
+# and only directories we provisioned are listed here.
+projects = data.setdefault("projects", {})
+if not isinstance(projects, dict):
+    projects = data["projects"] = {}
+for raw in os.environ.get("CLAUDE_TRUST_DIRS", "").split(":"):
+    d = os.path.realpath(raw) if raw else ""
+    if not d or not os.path.isdir(d):
+        continue
+    entry = projects.setdefault(d, {})
+    if not isinstance(entry, dict):
+        entry = projects[d] = {}
+    if entry.get("hasTrustDialogAccepted") is not True:
+        entry["hasTrustDialogAccepted"] = True
+        entry.setdefault("hasCompletedProjectOnboarding", True)
+        entry.setdefault("allowedTools", [])
+        changed.append(f"trust:{d}")
+
+if changed:
     tmp = path + ".tmp"
     with open(tmp, "w") as fh:
         json.dump(data, fh, indent=2)
     os.replace(tmp, path)
-    print("claude: marked onboarding complete so the TUI starts ready")
+    print("claude: seeded " + ", ".join(changed))
+else:
+    print("claude: onboarding and folder trust already seeded")
 PYEOF
 }
 

@@ -28,7 +28,8 @@ done
 export PATH
 unset d
 
-export npm_config_prefix="$HOME/.local"
+# Not exported: nvm refuses to load when npm_config_prefix is set, and the
+# warning shows up in every pane. Tools that need it set it themselves.
 export EDITOR="${EDITOR:-vim}"
 export PERSIST_ROOT="${APP_HOME:-$HOME}/persistent"
 
