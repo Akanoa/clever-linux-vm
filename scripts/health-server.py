@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -101,11 +102,38 @@ def start_agent(name, kind, cwd, label):
                                 timeout=120)
     _, got = herdr("agent", "get", name)
     agent = (got.get("result") or {}).get("agent") or {}
+
+    if not agent.get("interactive_ready"):
+        accept_bypass_warning(name)
+        _, got = herdr("agent", "get", name)
+        agent = (got.get("result") or {}).get("agent") or {}
     if agent.get("interactive_ready"):
         return 200, {"started": True, "pane": pane, "agent": agent}
     return 202, {"started": False, "pane": pane, "agent": agent,
                  "start_response": started, "start_code": start_code,
                  "hint": "agent is not interactive yet; poll GET /agents/<name>"}
+
+
+def accept_bypass_warning(name):
+    """Clear Claude Code's one-time bypass-permissions warning.
+
+    Turning bypassPermissions on introduces its own confirmation, which
+    would wedge the first agent on every brand-new VM. Answering it here is
+    not overriding a safety decision - the operator made that decision by
+    setting CLAUDE_PERMISSION_MODE. Deliberately narrow: it fires only when
+    that exact screen is on the pane.
+    """
+    if os.environ.get("CLAUDE_PERMISSION_MODE") != "bypassPermissions":
+        return False
+    code, out = herdr("agent", "read", name, "--source", "visible")
+    if code != 200:
+        return False
+    text = json.dumps(out)
+    if "Bypass Permissions mode" not in text or "Yes, I accept" not in text:
+        return False
+    herdr("agent", "send-keys", name, "2")
+    time.sleep(3)
+    return True
 
 
 def read_stage():
