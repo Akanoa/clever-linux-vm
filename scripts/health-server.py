@@ -24,7 +24,8 @@ STATE_FILE = os.environ.get("STATE_FILE", "/tmp/vm-agent-state")
 BOOT_LOG = os.environ.get("BOOT_LOG", "/tmp/vm-agent-boot.log")
 VM_NAME = os.environ.get("VM_AGENT_NAME", "vm-agent")
 FLEET_TOKEN = os.environ.get("VM_AGENT_FLEET_TOKEN", "")
-TOOLS = ["herdr", "claude", "opencode", "codex", "gh", "glab", "git", "s3cmd"]
+TOOLS = ["herdr", "claude", "opencode", "codex", "gh", "glab", "git", "s3cmd",
+         "moerae", "fleet", "cellar"]
 MAX_BODY = 64 * 1024
 MAX_OUT = 8 * 1024 * 1024
 OUT_DIR = os.path.expanduser("~/out")
