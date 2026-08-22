@@ -6,7 +6,10 @@
 # history are captured.
 set -uo pipefail
 
+# The FS Bucket is shared by the whole fleet; this VM only ever writes
+# under its own subtree, so a --delete sync cannot reach another box.
 PERSIST_ROOT="${PERSIST_ROOT:-${APP_HOME:-$HOME}/persistent}"
+VM_ROOT="$PERSIST_ROOT/vms/${VM_AGENT_NAME:-default}"
 LOCK="/tmp/vm-agent-snapshot.lock"
 
 SYNC_DIRS=(
@@ -23,13 +26,13 @@ EXCLUDES=(--exclude='*.sock' --exclude='*.lock' --exclude='*.log' --exclude='.pl
 snapshot() {
   local name path dst
   for entry in "${SYNC_DIRS[@]}"; do
-    name="${entry%%:*}"; path="${entry#*:}"; dst="$PERSIST_ROOT/state/$name"
+    name="${entry%%:*}"; path="${entry#*:}"; dst="$VM_ROOT/state/$name"
     [ -d "$path" ] || continue
     mkdir -p "$dst"
     rsync -a --delete "${EXCLUDES[@]}" "$path/" "$dst/" 2>/dev/null \
       || echo "vm-snapshot: failed to sync $name" >&2
   done
-  date -u +'%Y-%m-%dT%H:%M:%SZ' > "$PERSIST_ROOT/state/.last-snapshot" 2>/dev/null
+  date -u +'%Y-%m-%dT%H:%M:%SZ' > "$VM_ROOT/state/.last-snapshot" 2>/dev/null
 }
 
 # Never let two snapshots overlap; -n so the periodic loop skips rather
@@ -37,7 +40,7 @@ snapshot() {
 exec 9>"$LOCK"
 if flock -n 9; then
   snapshot
-  [ "${1:-}" = "--quiet" ] || echo "vm-snapshot: state saved to $PERSIST_ROOT/state"
+  [ "${1:-}" = "--quiet" ] || echo "vm-snapshot: state saved to $VM_ROOT/state"
 else
   [ "${1:-}" = "--quiet" ] || echo "vm-snapshot: another snapshot is running, skipped"
 fi

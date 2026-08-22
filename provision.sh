@@ -3,8 +3,9 @@
 #
 # Every step checks the desired state before touching anything, so running
 # this twice is a no-op and running it after a partial failure resumes
-# where it stopped. Each VM gets its own application, its own FS Bucket and
-# (by default) its own Cellar add-on. Everything the whole fleet shares -
+# where it stopped. Each VM gets its own application; storage is shared -
+# one Cellar add-on and one FS Bucket for the fleet, with each VM confined
+# to its own subtree of the bucket. Everything the whole fleet shares -
 # the git-commit key, the forge tokens, the commit identity - lives in one
 # free Configuration provider add-on linked to every app, so a secret is
 # rotated in a single place and the public key is registered on the forges
@@ -37,8 +38,10 @@ KEY_PATH="${KEY_PATH:-$SECRETS_DIR/id_ed25519}"
 PER_VM_KEY=false
 DEPLOY=true
 COUNT=1
-CELLAR_SHARED="${CELLAR_SHARED:-}"
 CONFIG_ADDON="${CONFIG_ADDON:-vm-agent-config}"
+CELLAR_ADDON="${CELLAR_ADDON:-vm-agent-cellar}"
+CELLAR_BUCKET_NAME="${CELLAR_BUCKET_NAME:-vm-agent-files}"
+FS_ADDON="${FS_ADDON:-vm-agent-fs}"
 FORGET=()
 GIT_NAME="${GIT_USER_NAME:-vm-agent}"
 GIT_EMAIL="${GIT_USER_EMAIL:-vm-agent@clever-cloud.local}"
@@ -109,6 +112,64 @@ ensure_env() {
   fi
 }
 
+# --------------------------------------------------- shared storage
+# One Cellar add-on and one FS Bucket for the whole fleet. Both are linked
+# to every application: object storage is concurrent-safe, and the FS
+# Bucket is kept safe by giving each VM its own subtree under vms/<name>
+# (see scripts/00-persist.sh) so no box can rsync over another's state.
+ensure_shared_addon() {
+  local provider="$1" name="$2" plan="$3" id out
+  id="$(addon_id_by_name "$name")"
+  if [ -z "$id" ]; then
+    say "creating $provider add-on $name" >&2
+    out="$(clever addon create "$provider" "$name" --plan "$plan" --region "$REGION" --format json 2>&1)"
+    id="$(addon_id_by_name "$name")"
+    if [ -z "$id" ]; then
+      printf '%s\n' "$out" | tail -5 >&2
+      die "could not create $provider add-on $name"
+    fi
+    ok "$provider add-on created: $id" >&2
+  else
+    skip "$provider add-on exists: $id" >&2
+  fi
+  printf '%s' "$id"
+}
+
+link_addon() {
+  local alias="$1" id="$2" label="$3"
+  if is_addon_linked "$alias" "$id"; then
+    skip "$label linked"
+  else
+    clever service link-addon "$id" --alias "$alias" >/dev/null 2>&1
+    is_addon_linked "$alias" "$id" && ok "$label linked" || die "could not link $label"
+  fi
+}
+
+# Flags any fs-bucket or Cellar add-on linked to the app that is not the
+# fleet's shared one.
+warn_stray_storage() {
+  local alias="$1" linked catalogue stray
+  linked="$(clever service --only-addons --format json --alias "$alias" 2>/dev/null)"
+  catalogue="$(clever addon list --format json 2>/dev/null)"
+  [ -n "$linked" ] && [ -n "$catalogue" ] || return 0
+
+  stray="$(jq -rn \
+    --argjson linked "$linked" --argjson cat "$catalogue" \
+    --arg cellar "$CELLAR_ADDON" --arg fs "$FS_ADDON" '
+      [ $linked.addons[]?
+        | select(.isLinked == true)
+        | .name as $n
+        | ($cat[] | select(.name == $n) | .providerId) as $p
+        | select($p == "fs-bucket" or $p == "cellar-addon")
+        | select($n != $cellar and $n != $fs)
+        | $n ] | join(" ")')"
+
+  if [ -n "$stray" ]; then
+    printf '%s\n' "$c_err  ! $alias also has storage add-ons linked: $stray$c_off" >&2
+    printf '%s\n' "$c_err    unlink and delete them, or /persistent may mount the wrong bucket$c_off" >&2
+  fi
+}
+
 # ---------------------------------------------------- shared config
 # Creates the Configuration provider once and returns its real id.
 ensure_config_provider() {
@@ -138,7 +199,7 @@ SHARED_SECRETS=(
   CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY
 )
 # Non-secret settings, always taken from the local configuration.
-SHARED_SETTINGS=(GITLAB_HOST GIT_USER_NAME GIT_USER_EMAIL GIT_SIGN_COMMITS)
+SHARED_SETTINGS=(GITLAB_HOST GIT_USER_NAME GIT_USER_EMAIL GIT_SIGN_COMMITS CELLAR_BUCKET)
 
 # Writes the fleet-wide variables. Changing a value restarts every linked app.
 sync_shared_config() {
@@ -158,6 +219,7 @@ sync_shared_config() {
   add_var GIT_USER_NAME    "$GIT_NAME"
   add_var GIT_USER_EMAIL   "$GIT_EMAIL"
   add_var GIT_SIGN_COMMITS "$SIGN_COMMITS"
+  add_var CELLAR_BUCKET    "$CELLAR_BUCKET_NAME"
 
   for var in "${SHARED_SECRETS[@]}"; do
     # --forget is the only way to take a secret back out: an empty local
@@ -245,62 +307,41 @@ provision_one() {
   fi
 
   # --- scaling ----------------------------------------------------------
-  local current_flavor
-  current_flavor="$(clever status --alias "$name" --format json 2>/dev/null \
-    | jq -r '.instances[0].flavor // ""')"
+  # Vertical only. A vm-agent is a pet, not cattle: its herdr server, its
+  # workspace and its agent state all live on one box, and a second
+  # instance of the *same* app would share VM_AGENT_NAME - so both would
+  # rsync --delete into the same subtree of the FS Bucket, and `clever ssh`
+  # would drop you on whichever one it felt like. NFS locks here are
+  # local_lock=all, so there is no cross-instance lock to save us either.
+  # Scale out by adding VMs (`--count`), never by adding instances.
+  local status_json current_flavor instance_count h_max
+  status_json="$(clever status --alias "$name" --format json 2>/dev/null)"
+  current_flavor="$(printf '%s' "$status_json"  | jq -r '.instances[0].flavor // ""')"
+  instance_count="$(printf '%s' "$status_json"  | jq -r '.instances[0].count // 1')"
+  h_max="$(printf '%s' "$status_json" | jq -r '.scalability.horizontal.max // 1')"
+
   if [ "$current_flavor" = "$FLAVOR" ]; then
     skip "flavor already $FLAVOR"
   else
     clever scale --flavor "$FLAVOR" --alias "$name" >/dev/null 2>&1 && ok "scaled to $FLAVOR"
   fi
 
-  # --- Cellar add-on ----------------------------------------------------
-  local cellar_name cellar_id
-  cellar_name="${CELLAR_SHARED:-$name-cellar}"
-  cellar_id="$(addon_id_by_name "$cellar_name")"
-  if [ -z "$cellar_id" ]; then
-    say "creating Cellar add-on $cellar_name"
-    out="$(clever addon create cellar-addon "$cellar_name" --plan S --region "$REGION" --format json 2>&1)"
-    cellar_id="$(addon_id_by_name "$cellar_name")"
-    if [ -z "$cellar_id" ]; then
-      printf '%s\n' "$out" | tail -5
-      die "could not create Cellar add-on $cellar_name"
-    fi
-    ok "Cellar add-on created: $cellar_id"
+  if [ "$instance_count" = "1" ] && [ "$h_max" = "1" ]; then
+    skip "pinned to a single instance"
   else
-    skip "Cellar add-on exists: $cellar_id"
-  fi
-  if is_addon_linked "$name" "$cellar_id"; then
-    skip "Cellar linked"
-  else
-    clever service link-addon "$cellar_id" --alias "$name" >/dev/null 2>&1
-    is_addon_linked "$name" "$cellar_id" && ok "Cellar linked" || die "could not link Cellar"
+    clever scale --instances 1 --alias "$name" >/dev/null 2>&1 \
+      && ok "pinned to a single instance (was count=$instance_count, max=$h_max)" \
+      || die "could not pin $name to one instance"
   fi
 
-  # --- FS Bucket add-on -------------------------------------------------
-  local fs_name fs_id bucket_host
-  fs_name="$name-fs"
-  fs_id="$(addon_id_by_name "$fs_name")"
-  if [ -z "$fs_id" ]; then
-    say "creating FS Bucket add-on $fs_name"
-    out="$(clever addon create fs-bucket "$fs_name" --plan s --region "$REGION" --format json 2>&1)"
-    fs_id="$(addon_id_by_name "$fs_name")"
-    if [ -z "$fs_id" ]; then
-      printf '%s\n' "$out" | tail -5
-      die "could not create FS Bucket add-on $fs_name"
-    fi
-    ok "FS Bucket add-on created: $fs_id"
-  else
-    skip "FS Bucket add-on exists: $fs_id"
-  fi
-  if is_addon_linked "$name" "$fs_id"; then
-    skip "FS Bucket linked"
-  else
-    clever service link-addon "$fs_id" --alias "$name" >/dev/null 2>&1
-    is_addon_linked "$name" "$fs_id" && ok "FS Bucket linked" || die "could not link FS Bucket"
-  fi
-  bucket_host="$(clever addon env "$fs_id" --format json 2>/dev/null | jq -r '.BUCKET_HOST // ""')"
-  [ -n "$bucket_host" ] || die "could not read BUCKET_HOST for $fs_name"
+  # --- shared storage ---------------------------------------------------
+  link_addon "$name" "$CELLAR_ID" "Cellar"
+  link_addon "$name" "$FS_ID"     "FS Bucket"
+
+  # A leftover per-VM add-on from the days before storage was shared will
+  # silently win the /persistent mount over the one CC_FS_BUCKET names,
+  # so the box ends up on the wrong bucket with no error anywhere.
+  warn_stray_storage "$name"
 
   # --- shared Configuration provider ------------------------------------
   local config_addon_id
@@ -317,8 +358,7 @@ provision_one() {
   # Only what genuinely differs per box lives here; everything shared comes
   # from the Configuration provider. CC_FS_BUCKET paths are resolved
   # relative to APP_HOME, hence the leading "/persistent".
-  ensure_env "$name" CC_FS_BUCKET  "/persistent:$bucket_host"
-  ensure_env "$name" CELLAR_BUCKET "$name-files"
+  ensure_env "$name" CC_FS_BUCKET  "/persistent:$FS_BUCKET_HOST"
   ensure_env "$name" VM_AGENT_NAME "$name"
 
   if $PER_VM_KEY; then
@@ -379,16 +419,11 @@ do_destroy() {
   local name="$1" confirmed="$2"
   $confirmed || die "refusing to destroy $name without --yes"
   hdr "destroying [$name]"
-  # The Configuration provider is fleet-wide and deliberately left alone.
-  for addon in "$name-cellar" "$name-fs"; do
-    local id; id="$(addon_id_by_name "$addon")"
-    if [ -n "$id" ]; then
-      clever addon delete "$id" --yes >/dev/null 2>&1 && ok "deleted add-on $addon" \
-        || say "could not delete add-on $addon (delete it from the Console)"
-    else
-      skip "add-on $addon does not exist"
-    fi
-  done
+  # Storage and configuration are fleet-wide; only the application goes.
+  # The VM's subtree on the FS Bucket is left in place - deleting an app
+  # should not silently destroy whatever was still in its workspace.
+  skip "shared add-ons ($CELLAR_ADDON, $FS_ADDON, $CONFIG_ADDON) left alone"
+  say "its data stays at vms/$name on the FS Bucket; remove it by hand if you want it gone"
   if [ -n "$(app_id_by_name "$name")" ]; then
     clever delete --alias "$name" --yes >/dev/null 2>&1 && ok "deleted application $name"
   else
@@ -408,7 +443,8 @@ while [ $# -gt 0 ]; do
     --flavor)   FLAVOR="$2"; shift 2 ;;
     --region)   REGION="$2"; shift 2 ;;
     --count)    COUNT="$2"; shift 2 ;;
-    --cellar)   CELLAR_SHARED="$2"; shift 2 ;;
+    --cellar)   CELLAR_ADDON="$2"; shift 2 ;;
+    --fs)       FS_ADDON="$2"; shift 2 ;;
     --config)   CONFIG_ADDON="$2"; shift 2 ;;
     --forget)   FORGET+=("$2"); shift 2 ;;
     --key)      KEY_PATH="$2"; shift 2 ;;
@@ -433,9 +469,13 @@ case "$ACTION" in
     [ "$ACTION" = all ] && { [ -s "$FLEET_FILE" ] || die "vms.txt is empty - provision a VM first"; }
     [ "$ACTION" = provision ] && [ "${#NAMES[@]}" -eq 0 ] && usage 1
 
-    hdr "shared configuration"
+    hdr "shared resources"
     $PER_VM_KEY || ensure_key "$KEY_PATH"
     CONFIG_ID="$(ensure_config_provider)"
+    CELLAR_ID="$(ensure_shared_addon cellar-addon "$CELLAR_ADDON" S)"
+    FS_ID="$(ensure_shared_addon fs-bucket "$FS_ADDON" s)"
+    FS_BUCKET_HOST="$(clever addon env "$FS_ID" --format json 2>/dev/null | jq -r '.BUCKET_HOST // ""')"
+    [ -n "$FS_BUCKET_HOST" ] || die "could not read BUCKET_HOST for $FS_ADDON"
     sync_shared_config "$CONFIG_ID"
 
     if [ "$ACTION" = all ]; then

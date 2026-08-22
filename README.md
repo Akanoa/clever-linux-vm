@@ -8,8 +8,9 @@ working while nobody is attached.
 |---|---|
 | Runtime | `linux` (Exherbo, user `bas`, **no root, no package manager**) |
 | Default flavor | M — 4 vCPU / 4 GB |
-| Persistence | one FS Bucket per VM, mounted at `$APP_HOME/persistent` |
-| Object storage | one Cellar bucket per VM, `<vm-name>-files` |
+| Persistence | one FS Bucket for the fleet, mounted at `$APP_HOME/persistent` |
+| Object storage | one Cellar bucket for the fleet |
+| Instances | pinned to 1 per app — scale out by adding VMs, not instances |
 | Health | `https://app-<id>.cleverapps.io/status` — `./provision.sh --list` prints the real URLs |
 
 ## Provisioning a VM
@@ -26,8 +27,28 @@ partial failure resumes where it stopped.
 ./provision.sh --destroy agent-3 --yes # tear one down, add-ons included
 ```
 
-Each VM gets its own application, its own FS Bucket and its own Cellar
-add-on (`--cellar <name>` reuses a shared one instead).
+Each VM gets its own application. Storage is **shared across the fleet** —
+one Cellar add-on and one FS Bucket, linked to every app — because N idle
+add-ons per VM is pure waste:
+
+```
+persistent/                  the one FS Bucket, mounted on every VM
+├── vms/
+│   ├── web-agent/{workspace,state}
+│   └── api-agent/{workspace,state}
+└── shared/                  → ~/shared on every box
+```
+
+Each VM is confined to `vms/$VM_AGENT_NAME`, so `vm-snapshot`'s
+`rsync --delete` can never reach another box's state. `~/shared` is the one
+place they meet on purpose. Cellar needs no such split — S3 is
+concurrent-safe, so the fleet shares one bucket.
+
+**Apps are pinned to a single instance.** A vm-agent is a pet: its herdr
+server, workspace and agent state live on one box, and two instances of the
+same app would share `VM_AGENT_NAME` and fight over the same subtree — NFS
+here mounts `local_lock=all`, so there is no cross-instance lock to arbitrate.
+Scale out with `--count`, never with `clever scale --instances`.
 
 Everything the fleet has in common lives in a single free **Configuration
 provider** add-on, `vm-agent-config`, linked to every app:
@@ -46,7 +67,12 @@ app would shadow the provider, so `provision.sh` removes them from the app
 env when it takes ownership of a key.
 
 `--per-vm-key` opts out of the shared commit key and generates one per box,
-kept in the app's own env instead.
+kept in the app's own env instead. `--cellar` / `--fs` point the fleet at
+differently-named storage add-ons.
+
+If an app has a *stray* storage add-on linked — a per-VM leftover from
+before storage was shared — `provision.sh` warns: it would silently win the
+`/persistent` mount over the bucket `CC_FS_BUCKET` names.
 
 Fleet-wide settings live in `fleet.conf`: commit identity, signing, GitLab
 host, default flavor and region. Start from the template:
@@ -149,8 +175,8 @@ and no `apt` on this runtime.
 
 Two different mechanisms, because the FS Bucket is NFS-backed:
 
-* **`~/workspace` → symlinked onto the bucket.** Repos and uncommitted work
-  are written through immediately. Slightly slower than local disk; worth
+* **`~/workspace` → symlinked into `vms/$VM_AGENT_NAME/workspace` on the
+  bucket.** Repos and uncommitted work are written through immediately. Slightly slower than local disk; worth
   it, since this is the data you cannot lose.
 * **Agent state → local disk, rsync'd to the bucket** every 5 minutes, on
   clean shutdown, and whenever you run `vm-snapshot`. These directories
