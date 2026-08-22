@@ -178,6 +178,22 @@ fleet start <vm> <name> [kind]     # launch an agent in a fresh pane
 fleet prompt <vm>/<name> "..."     # submit a prompt
 fleet read <vm>/<name>             # recent terminal output
 fleet keys <vm>/<name> 1           # answer a prompt the agent is blocked on
+fleet task <vm>/<name> "..."       # prompt, and collect the answer to a file
+fleet fetch <vm>/<name>            # print that file
+fleet out <vm>                     # list a VM's result files
+```
+
+### Getting results back
+
+Do not read results off the terminal. Agent UIs **collapse tool output** —
+a listing the agent printed comes back as `Ran 1 shell command`, summary
+intact and data gone. `fleet task` instead asks the agent to write its
+answer to `~/out/<name>.md`, which lives on the shared FS Bucket (so it
+survives redeploys and any VM can read it) and is served by the endpoint.
+
+```bash
+fleet task vm-agent-2/gitlab "list all my GitLab projects with pagination"
+fleet fetch vm-agent-2/gitlab
 ```
 
 It runs on the VMs (agents can drive each other) and on your laptop, where
@@ -205,6 +221,14 @@ does **not** suppress the interactive gates, so boot seeds them:
 * `hasCompletedOnboarding` — otherwise the TUI stops at the login selector
 * per-directory `hasTrustDialogAccepted` — otherwise the folder-trust prompt
 * `permissions.defaultMode` from `CLAUDE_PERMISSION_MODE`
+* herdr's own `onboarding = false`, or it greets whoever attaches
+* the one-time bypass-permissions warning, cleared by the endpoint when
+  `CLAUDE_PERMISSION_MODE=bypassPermissions` — turning the gate off
+  introduces a gate of its own
+
+`acceptEdits` is not enough for unattended work: every *novel* command
+re-prompts, including "contains shell syntax that cannot be statically
+analyzed". Autonomous agents need `bypassPermissions`.
 
 The first two live in `~/.claude.json` — a *file*, not the `~/.claude`
 directory — which is why it is snapshotted separately from the state dirs.
