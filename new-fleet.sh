@@ -100,6 +100,12 @@ ok "logged in as $(clever profile 2>/dev/null | awk '/^Email/ {print $2; exit}')
 [ -f "$CONF" ]   && . "$CONF"
 [ -f "$TOKENS" ] && . "$TOKENS"
 
+# What the fleet is actually using right now. Recomputing these from a
+# name and writing the result back is how a live add-on gets orphaned.
+CONFIG_ADDON_PREV="${CONFIG_ADDON:-}"
+CELLAR_ADDON_PREV="${CELLAR_ADDON:-}"
+FS_ADDON_PREV="${FS_ADDON:-}"
+
 # ------------------------------------------------------- existing fleet?
 # grep -c already prints 0 when it matches nothing, and exits 1 while
 # doing it - so a `|| echo 0` fallback would append a second zero.
@@ -189,16 +195,33 @@ if [ "$EXISTING" -eq 0 ]; then
   hdr "fleet name"
   note "names the shared add-ons: <name>-config, <name>-cellar, <name>-fs."
   note "Reusing a name means reusing that fleet's storage and secrets."
-  ask FLEET_NAME "fleet name" "${FLEET_NAME:-vm-agent}"
+  ask FLEET_NAME "fleet name" "${FLEET_NAME:-${CONFIG_ADDON_PREV%-config}}"
+  [ -n "$FLEET_NAME" ] || FLEET_NAME=vm-agent
   case "$FLEET_NAME" in
-    *[!a-z0-9-]*|"") die "fleet name must be lowercase letters, digits and dashes" ;;
+    *[!a-z0-9-]*) die "fleet name must be lowercase letters, digits and dashes" ;;
   esac
+  CONFIG_ADDON="$FLEET_NAME-config"
+  CELLAR_ADDON="$FLEET_NAME-cellar"
+  FS_ADDON="$FLEET_NAME-fs"
+  # Renaming does not move the old add-ons - it abandons them, and they
+  # keep billing where nothing will ever look for them again.
+  if [ -n "$CONFIG_ADDON_PREV" ] && [ "$CONFIG_ADDON_PREV" != "$CONFIG_ADDON" ]; then
+    warn "$CONFIG_ADDON_PREV, $CELLAR_ADDON_PREV and $FS_ADDON_PREV are left behind"
+    note "nothing will reference them again, and they keep billing. Delete them"
+    note "from the console, or answer no here and purge the old fleet first:"
+    note "  ./provision.sh --destroy --all --purge --yes"
+    ask_yn "carry on with the new name anyway?" y || die "stopped - nothing was written"
+  fi
 else
-  FLEET_NAME="${FLEET_NAME:-vm-agent}"
+  # Joining a fleet that already exists: its add-ons are whatever fleet.conf
+  # recorded. Deriving them from a name again would repoint the fleet at a
+  # different - probably non-existent - set and orphan the real ones.
+  FLEET_NAME="${FLEET_NAME:-${CONFIG_ADDON_PREV%-config}}"
+  [ -n "$FLEET_NAME" ] || FLEET_NAME=vm-agent
+  CONFIG_ADDON="${CONFIG_ADDON_PREV:-$FLEET_NAME-config}"
+  CELLAR_ADDON="${CELLAR_ADDON_PREV:-$FLEET_NAME-cellar}"
+  FS_ADDON="${FS_ADDON_PREV:-$FLEET_NAME-fs}"
 fi
-CONFIG_ADDON="$FLEET_NAME-config"
-CELLAR_ADDON="$FLEET_NAME-cellar"
-FS_ADDON="$FLEET_NAME-fs"
 
 # -------------------------------------------------------------- identity
 hdr "commit identity"
