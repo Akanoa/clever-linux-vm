@@ -7,4 +7,5 @@ persistent/
 # Local, account-specific state - never publish
 .clever.json
 fleet.conf
+fleet.conf.bak
 vms.txt
