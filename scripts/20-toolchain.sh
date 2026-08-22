@@ -56,6 +56,25 @@ install_glab() {
   rm -rf "$tmp"
 }
 
+# Moerae - hierarchical memory for agents, so a long task survives context
+# compaction. Rust, single binary, no service and no API key; the ~300MB
+# embedding model is fetched on first use.
+install_moerae() {
+  have moerae && { log "moerae already present"; return 0; }
+  local ver tmp src
+  ver=$(curl -fsSL https://api.github.com/repos/Moerae-AI/Moerae/releases/latest | jq -r .tag_name)
+  [ -n "$ver" ] && [ "$ver" != "null" ] || { log "could not resolve the moerae version"; return 1; }
+  tmp=$(mktemp -d)
+  curl -fsSL "https://github.com/Moerae-AI/Moerae/releases/download/${ver}/moerae-x86_64-unknown-linux-gnu.tar.xz" \
+    | tar xJ -C "$tmp" || { rm -rf "$tmp"; return 1; }
+  for b in moerae moerae-repl; do
+    src="$(find "$tmp" -type f -name "$b" -perm -u+x | head -1)"
+    [ -n "$src" ] && install -m 755 "$src" "$HOME/.local/bin/$b"
+  done
+  rm -rf "$tmp"
+  have moerae || return 1
+}
+
 install_helpers() {
   install -m 755 "$APP_HOME/tools/cellar" "$HOME/.local/bin/cellar"
   install -m 755 "$APP_HOME/tools/fleet"  "$HOME/.local/bin/fleet"
@@ -63,7 +82,7 @@ install_helpers() {
 
 # Downloads are independent; run them concurrently to keep boot short.
 pids=()
-for fn in install_herdr install_claude install_opencode install_codex install_gh install_glab; do
+for fn in install_herdr install_claude install_opencode install_codex install_gh install_glab install_moerae; do
   ( step "$fn" "$fn" ) & pids+=($!)
 done
 for pid in "${pids[@]}"; do wait "$pid"; done
@@ -71,6 +90,6 @@ for pid in "${pids[@]}"; do wait "$pid"; done
 step install_helpers install_helpers || true
 
 log "installed:"
-for c in herdr claude opencode codex gh glab cellar fleet; do
+for c in herdr claude opencode codex gh glab cellar fleet moerae; do
   printf '[vm-agent]   %-10s %s\n' "$c" "$(command -v "$c" 2>/dev/null || echo 'MISSING')"
 done

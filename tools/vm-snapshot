@@ -20,8 +20,9 @@ SYNC_DIRS=(
   "herdr:$HOME/.config/herdr"
   "gh:$HOME/.config/gh"
   "glab:$HOME/.config/glab-cli"
+  "moerae:$HOME/.moerae"
 )
-EXCLUDES=(--exclude='*.sock' --exclude='*.lock' --exclude='*.log' --exclude='.plugins.lock')
+EXCLUDES=(--exclude='*.sock' --exclude='*.lock' --exclude='*.log' --exclude='.plugins.lock' --exclude='models/')
 SYNC_FILES=(
   "claude.json:$HOME/.claude.json"
 )

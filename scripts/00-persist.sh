@@ -30,6 +30,7 @@ SYNC_DIRS=(
   "herdr:$HOME/.config/herdr"
   "gh:$HOME/.config/gh"
   "glab:$HOME/.config/glab-cli"
+  "moerae:$HOME/.moerae"
 )
 # Single files that matter as much as the directories: ~/.claude.json holds
 # Claude Code's onboarding and per-project trust state.
@@ -38,7 +39,7 @@ SYNC_FILES=(
 )
 
 # Sockets and logs are per-boot; restoring them confuses herdr on startup.
-SYNC_EXCLUDES=(--exclude='*.sock' --exclude='*.lock' --exclude='*.log' --exclude='.plugins.lock')
+SYNC_EXCLUDES=(--exclude='*.sock' --exclude='*.lock' --exclude='*.log' --exclude='.plugins.lock' --exclude='models/')
 
 if ! mountpoint -q "$PERSIST_ROOT" 2>/dev/null; then
   log "WARNING: $PERSIST_ROOT is not a mount point - CC_FS_BUCKET may be unset."
