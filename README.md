@@ -248,6 +248,7 @@ fleet keys <vm>/<name> 1           # answer a prompt the agent is blocked on
 fleet task <vm>/<name> "..."       # prompt, and collect the answer to a file
 fleet fetch <vm>/<name>            # print that file
 fleet out <vm>                     # list a VM's result files
+fleet get <vm> <path>              # raw GET against one VM's endpoint
 ```
 
 ### Getting results back
@@ -386,10 +387,15 @@ pins the key for every host.
 
 ### Registering the key on your forges
 
-`provision.sh` prints the public key when it finishes. Add it as **both**
+`new-fleet.sh` does this for you: given a GitHub or GitLab token it
+registers the key for **both** authentication and signing, and skips
+whichever forge already has it — so re-running never leaves duplicates.
+
+`provision.sh` on its own only prints the key. Add it by hand as **both**
 an authentication and a signing key:
 
-* **GitHub** — <https://github.com/settings/keys>
+* **GitHub** — <https://github.com/settings/keys> and
+  <https://github.com/settings/ssh/signing>
 * **GitLab** — the CLI can do it once `GITLAB_TOKEN` is set:
 
   ```bash

@@ -1,5 +1,6 @@
 # Fleet-wide settings for provision.sh.
 #
+#     ./new-fleet.sh              writes this file by asking, or
 #     cp fleet.conf.example fleet.conf
 #
 # fleet.conf is gitignored because it carries your name and email; secrets
@@ -30,6 +31,33 @@
 # can collide with another tenant's.
 # : "${CELLAR_BUCKET_NAME:=my-unique-bucket}"
 
-# Default size and region for new VMs.
+# Size of VMs that do not exist yet: pico nano XS S M L XL 2XL 3XL. This
+# is only a default - an existing VM keeps the size it has until you ask
+# for a change with `--flavor`, so re-applying the fleet never resizes a
+# box that was scaled up on purpose.
 : "${FLAVOR:=M}"
 : "${REGION:=par}"
+
+# Organisation owning the applications and the add-ons. Unset means your
+# personal space, which is what clever targets with no --org.
+# : "${CLEVER_ORG:=orga_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}"
+
+# The three shared add-ons are found by *name*, so these are what keep one
+# fleet's storage and secrets separate from another's in the same
+# organisation. Change them and provision.sh looks for - and creates - a
+# different set: the old ones are not moved, they are abandoned, and they
+# keep billing where nothing will look for them again. Delete a fleet's
+# add-ons with `./provision.sh --destroy --all --purge --yes` before
+# renaming, not after.
+: "${FLEET_NAME:=vm-agent}"
+: "${CONFIG_ADDON:=vm-agent-config}"
+: "${CELLAR_ADDON:=vm-agent-cellar}"
+: "${FS_ADDON:=vm-agent-fs}"
+
+# Where the shared commit key lives. One key for the whole fleet unless
+# provision.sh is given --per-vm-key.
+# : "${KEY_PATH:=.secrets/id_ed25519}"
+
+# Only read by ./new-fleet.sh, to offer your last answers as defaults.
+: "${AGENT_BASE:=agent}"
+: "${AGENT_COUNT:=2}"
