@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Talk to the other VMs in the fleet.
+#
+# herdr deliberately has no federation - `--remote` errors with "can only
+# be specified once" - so this fills the gap over the one channel Clever
+# Cloud actually routes between instances: each VM's own :8080 endpoint,
+# published at https://app-<id>.cleverapps.io and protected by a shared
+# token. Arbitrary ports are not reachable VM-to-VM, public or private.
+#
+#   fleet status                     one line per VM
+#   fleet agents                     every agent on every box
+#   fleet read <vm>/<agent>          recent terminal output
+#   fleet prompt <vm>/<agent> "..."  submit a prompt
+#   fleet keys <vm>/<agent> esc      send key presses
+#   fleet get <vm> <path>            raw GET against one VM's endpoint
+set -uo pipefail
+
+# On a VM these come from the shared Configuration provider; locally,
+# provision.sh drops them in .secrets/fleet.env.
+if [ -z "${VM_AGENT_FLEET:-}" ]; then
+  for candidate in "$(dirname "${BASH_SOURCE[0]}")/../.secrets/fleet.env" \
+                   "$PWD/.secrets/fleet.env"; do
+    [ -f "$candidate" ] && . "$candidate" && break
+  done
+fi
+
+FLEET="${VM_AGENT_FLEET:-}"
+TOKEN="${VM_AGENT_FLEET_TOKEN:-}"
+SELF="${VM_AGENT_NAME:-}"
+
+c_ok=$'\033[32m'; c_dim=$'\033[2m'; c_err=$'\033[31m'; c_off=$'\033[0m'
+die() { printf '%s%s%s\n' "$c_err" "fleet: $*" "$c_off" >&2; exit 1; }
+
+[ -n "$FLEET" ] || die "no roster - set VM_AGENT_FLEET or run ./provision.sh --all"
+[ -n "$TOKEN" ] || die "no token - set VM_AGENT_FLEET_TOKEN or run ./provision.sh --all"
+
+vm_names() { printf '%s' "$FLEET" | tr ',' '\n' | cut -d= -f1; }
+vm_url()   { printf '%s' "$FLEET" | tr ',' '\n' | awk -F= -v n="$1" '$1==n{print $2; exit}'; }
+
+# $1 method, $2 vm, $3 path, $4 optional json body
+call() {
+  local method="$1" vm="$2" path="$3" body="${4:-}" url
+  url="$(vm_url "$vm")"
+  [ -n "$url" ] || die "unknown VM: $vm (known: $(vm_names | tr '\n' ' '))"
+  if [ -n "$body" ]; then
+    curl -sS --max-time 60 -X "$method" "$url$path" \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" -d "$body"
+  else
+    curl -sS --max-time 30 -X "$method" "$url$path" \
+      -H "Authorization: Bearer $TOKEN"
+  fi
+}
+
+split_target() {  # vm/agent -> sets TGT_VM, TGT_AGENT
+  case "$1" in
+    */*) TGT_VM="${1%%/*}"; TGT_AGENT="${1#*/}" ;;
+    *)   die "target must be <vm>/<agent>, got '$1'" ;;
+  esac
+}
+
+cmd_status() {
+  printf '  %-16s %-9s %-7s %-9s %s\n' VM REACHABLE STAGE AGENTS AUTH
+  local name out stage agents auth marker
+  while read -r name; do
+    [ -n "$name" ] || continue
+    marker=""; [ "$name" = "$SELF" ] && marker=" *"
+    out="$(call GET "$name" /status 2>/dev/null)"
+    if ! printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
+      printf '  %-16s %s%-9s%s\n' "$name$marker" "$c_err" "no" "$c_off"
+      continue
+    fi
+    stage="$(printf '%s' "$out" | jq -r '.stage // "?"')"
+    auth="$(printf '%s' "$out"  | jq -r '.agent_auth.claude // "-"')"
+    agents="$(call GET "$name" /agents 2>/dev/null | jq -r '.result.agents | length' 2>/dev/null)"
+    printf '  %-16s %s%-9s%s %-7s %-9s %s\n' \
+      "$name$marker" "$c_ok" "yes" "$c_off" "$stage" "${agents:-?}" "$auth"
+  done < <(vm_names)
+  printf '%s' "$c_dim"; printf '  * = this VM\n'; printf '%s' "$c_off"
+}
+
+cmd_agents() {
+  local name out
+  while read -r name; do
+    [ -n "$name" ] || continue
+    printf '\n\033[1m%s\033[0m\n' "$name"
+    out="$(call GET "$name" /agents 2>/dev/null)"
+    printf '%s' "$out" | jq -e '.result.agents' >/dev/null 2>&1 || {
+      printf '  %sunreachable%s\n' "$c_err" "$c_off"; continue; }
+    if [ "$(printf '%s' "$out" | jq -r '.result.agents | length')" = "0" ]; then
+      printf '  %sno agents%s\n' "$c_dim" "$c_off"
+    else
+      printf '%s' "$out" | jq -r '.result.agents[] |
+        "  \(.name // .id)  \(.state // .status // "?")  \(.kind // "")"'
+    fi
+  done < <(vm_names)
+}
+
+case "${1:-status}" in
+  status) cmd_status ;;
+  agents) cmd_agents ;;
+  read)
+    split_target "${2:?usage: fleet read <vm>/<agent>}"
+    call GET "$TGT_VM" "/agents/$TGT_AGENT/read?source=${3:-recent}" \
+      | jq -r '.result.output // .output // .' ;;
+  prompt)
+    split_target "${2:?usage: fleet prompt <vm>/<agent> \"text\"}"
+    [ $# -ge 3 ] || die 'usage: fleet prompt <vm>/<agent> "text"'
+    call POST "$TGT_VM" "/agents/$TGT_AGENT/prompt" \
+      "$(jq -nc --arg t "$3" '{text:$t}')" | jq . ;;
+  keys)
+    split_target "${2:?usage: fleet keys <vm>/<agent> <key>...}"
+    shift 2
+    [ $# -ge 1 ] || die "usage: fleet keys <vm>/<agent> <key>..."
+    call POST "$TGT_VM" "/agents/$TGT_AGENT/keys" \
+      "$(printf '%s\n' "$@" | jq -Rsc 'split("\n") | map(select(length>0)) | {keys:.}')" | jq . ;;
+  get)
+    call GET "${2:?usage: fleet get <vm> <path>}" "${3:?usage: fleet get <vm> <path>}" ;;
+  ls)  vm_names ;;
+  -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)   die "unknown command: $1 (try --help)" ;;
+esac

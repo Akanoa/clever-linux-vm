@@ -58,6 +58,7 @@ install_glab() {
 
 install_helpers() {
   install -m 755 "$APP_HOME/tools/cellar" "$HOME/.local/bin/cellar"
+  install -m 755 "$APP_HOME/tools/fleet"  "$HOME/.local/bin/fleet"
 }
 
 # Downloads are independent; run them concurrently to keep boot short.
@@ -70,6 +71,6 @@ for pid in "${pids[@]}"; do wait "$pid"; done
 step install_helpers install_helpers || true
 
 log "installed:"
-for c in herdr claude opencode codex gh glab cellar; do
+for c in herdr claude opencode codex gh glab cellar fleet; do
   printf '[vm-agent]   %-10s %s\n' "$c" "$(command -v "$c" 2>/dev/null || echo 'MISSING')"
 done
