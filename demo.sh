@@ -11,6 +11,12 @@
 # honours.
 set -uo pipefail
 
+print_header_comment() {
+  # The full leading comment block - not a fixed line range, which silently
+  # truncates the help as soon as anyone adds a line to it.
+  awk 'NR > 1 { if (/^#/) { sub(/^# ?/, ""); print } else { exit } }' "$0"
+}
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VM="${2:-demo-agent}"
 SOCKET="vm-demo"
@@ -121,6 +127,6 @@ case "${1:-start}" in
   start)  cmd_start ;;
   layout) cmd_layout ;;
   stop)   cmd_stop ;;
-  -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help) print_header_comment ;;
   *) die "unknown command: ${1:-} (try --help)" ;;
 esac

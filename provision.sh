@@ -15,9 +15,10 @@
 #   ./provision.sh agent --count 4           agent-1 .. agent-4
 #   ./provision.sh --all                     re-apply to every VM in vms.txt
 #   ./provision.sh --list                    show the fleet
-#   --force                                  deploy even if agents are working
-#   ./provision.sh --all --forget OPENAI_API_KEY   drop a shared secret
 #   ./provision.sh --destroy agent-3 --yes   tear one down
+#   ./provision.sh --all --forget OPENAI_API_KEY   drop a shared secret
+#
+#   --force   deploy even while agents are working (kills their panes)
 set -uo pipefail
 
 # ---------------------------------------------------------------- config
@@ -545,7 +546,12 @@ write_local_fleet_env() {
   fi
 }
 
-usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+print_header_comment() {
+  # The full leading comment block - not a fixed line range, which silently
+  # truncates the help as soon as anyone adds a line to it.
+  awk 'NR > 1 { if (/^#/) { sub(/^# ?/, ""); print } else { exit } }' "$0"
+}
+usage() { print_header_comment; exit "${1:-0}"; }
 
 # ------------------------------------------------------------------ main
 need clever; need jq; need ssh-keygen; need base64

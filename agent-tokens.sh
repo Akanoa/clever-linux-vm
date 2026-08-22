@@ -12,6 +12,12 @@
 #   ./agent-tokens.sh unset <VAR>     remove it
 set -uo pipefail
 
+print_header_comment() {
+  # The full leading comment block - not a fixed line range, which silently
+  # truncates the help as soon as anyone adds a line to it.
+  awk 'NR > 1 { if (/^#/) { sub(/^# ?/, ""); print } else { exit } }' "$0"
+}
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SECRETS_DIR="$ROOT/.secrets"
 TOKENS="$SECRETS_DIR/tokens.env"
@@ -124,6 +130,6 @@ case "${1:-show}" in
   unset)    [ $# -ge 2 ] || die "usage: ./agent-tokens.sh unset <VAR>"
             is_known "$2" || die "unknown variable: $2"
             drop "$2"; ok "$2 removed"; do_show ;;
-  -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help) print_header_comment ;;
   *)        die "unknown command: $1 (try --help)" ;;
 esac
