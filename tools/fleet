@@ -21,13 +21,16 @@
 set -uo pipefail
 
 # On a VM these come from the shared Configuration provider; locally,
-# provision.sh drops them in .secrets/fleet.env.
-if [ -z "${VM_AGENT_FLEET:-}" ]; then
-  for candidate in "$(dirname "${BASH_SOURCE[0]}")/../.secrets/fleet.env" \
-                   "$PWD/.secrets/fleet.env"; do
-    [ -f "$candidate" ] && . "$candidate" && break
-  done
-fi
+# provision.sh drops them in .secrets/fleet.env. When both exist the file
+# is the fresher one: a VM_AGENT_FLEET exported in some earlier shell
+# outlives the fleet it described, and every VM in it then reports as
+# unreachable rather than as gone. So the file wins, and we say so when
+# the two actually disagree.
+shell_fleet="${VM_AGENT_FLEET:-}"
+for candidate in "$(dirname "${BASH_SOURCE[0]}")/../.secrets/fleet.env" \
+                 "$PWD/.secrets/fleet.env"; do
+  [ -f "$candidate" ] && . "$candidate" && break
+done
 
 FLEET="${VM_AGENT_FLEET:-}"
 TOKEN="${VM_AGENT_FLEET_TOKEN:-}"
@@ -35,6 +38,11 @@ SELF="${VM_AGENT_NAME:-}"
 
 c_ok=$'\033[32m'; c_dim=$'\033[2m'; c_err=$'\033[31m'; c_off=$'\033[0m'
 die() { printf '%s%s%s\n' "$c_err" "fleet: $*" "$c_off" >&2; exit 1; }
+
+if [ -n "$shell_fleet" ] && [ "$shell_fleet" != "$FLEET" ]; then
+  printf '%s%s%s\n' "$c_dim" \
+    "fleet: your exported VM_AGENT_FLEET is stale - using .secrets/fleet.env" "$c_off" >&2
+fi
 
 [ -n "$FLEET" ] || die "no roster - set VM_AGENT_FLEET or run ./provision.sh --all"
 [ -n "$TOKEN" ] || die "no token - set VM_AGENT_FLEET_TOKEN or run ./provision.sh --all"
@@ -57,6 +65,17 @@ call() {
   fi
 }
 
+# jq 1.6 exits 0 when its input is empty - the filter never runs, so there
+# is no failed output to report - which quietly turns every `jq -e` guard
+# into "yes" whenever the command feeding it produced nothing at all: a
+# curl that could not connect, a clever call that failed. Insist on real
+# input before believing the filter.
+json_has() {  # $1.. jq args (filter last); JSON on stdin
+  local doc; doc="$(cat)"
+  [ -n "$doc" ] || return 1
+  printf '%s' "$doc" | jq -e "$@" >/dev/null 2>&1
+}
+
 split_target() {  # vm/agent -> sets TGT_VM, TGT_AGENT
   case "$1" in
     */*) TGT_VM="${1%%/*}"; TGT_AGENT="${1#*/}" ;;
@@ -71,7 +90,7 @@ cmd_status() {
     [ -n "$name" ] || continue
     marker=""; [ "$name" = "$SELF" ] && marker=" *"
     out="$(call GET "$name" /status 2>/dev/null)"
-    if ! printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
+    if ! printf '%s' "$out" | json_has .; then
       printf '  %-16s %s%-9s%s\n' "$name$marker" "$c_err" "no" "$c_off"
       continue
     fi
@@ -90,7 +109,7 @@ cmd_agents() {
     [ -n "$name" ] || continue
     printf '\n\033[1m%s\033[0m\n' "$name"
     out="$(call GET "$name" /agents 2>/dev/null)"
-    printf '%s' "$out" | jq -e '.result.agents' >/dev/null 2>&1 || {
+    printf '%s' "$out" | json_has '.result.agents' || {
       printf '  %sunreachable%s\n' "$c_err" "$c_off"; continue; }
     if [ "$(printf '%s' "$out" | jq -r '.result.agents | length')" = "0" ]; then
       printf '  %sno agents%s\n' "$c_dim" "$c_off"

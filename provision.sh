@@ -92,14 +92,25 @@ cp_write() {
     -H "Content-Type: application/json" -d "$2" 2>/dev/null
 }
 
+# jq 1.6 exits 0 when its input is empty - the filter never runs, so there
+# is no failed output to report - which quietly turns every `jq -e` guard
+# into "yes" whenever the command feeding it produced nothing at all: a
+# curl that could not connect, a clever call that failed. Insist on real
+# input before believing the filter.
+json_has() {  # $1.. jq args (filter last); JSON on stdin
+  local doc; doc="$(cat)"
+  [ -n "$doc" ] || return 1
+  printf '%s' "$doc" | jq -e "$@" >/dev/null 2>&1
+}
+
 is_linked_locally() {
-  [ -f "$ROOT/.clever.json" ] || return 1
+  [ -s "$ROOT/.clever.json" ] || return 1
   jq -e --arg id "$1" '.apps[]? | select(.app_id==$id)' "$ROOT/.clever.json" >/dev/null 2>&1
 }
 
 is_addon_linked() {
   clever service --only-addons --format json --alias "$1" 2>/dev/null \
-    | jq -e --arg id "$2" '.addons[]? | select(.id==$id and .isLinked==true)' >/dev/null 2>&1
+    | json_has --arg id "$2" '.addons[]? | select(.id==$id and .isLinked==true)'
 }
 
 env_value() {
@@ -237,7 +248,7 @@ busy_agents() {
   for entry in $(printf '%s' "$roster" | tr ',' ' '); do
     vm="${entry%%=*}"; url="${entry#*=}"
     out="$(curl -sS --max-time 10 "$url/agents" -H "Authorization: Bearer $token" 2>/dev/null)" || continue
-    printf '%s' "$out" | jq -e '.result.agents' >/dev/null 2>&1 || continue
+    printf '%s' "$out" | json_has '.result.agents' || continue
     while read -r a; do
       [ -n "$a" ] && busy="${busy:+$busy }$vm/$a"
     done < <(printf '%s' "$out" | jq -r '.result.agents[]?
@@ -309,7 +320,7 @@ sync_shared_config() {
     # --forget is the only way to take a secret back out: an empty local
     # value means "keep what the provider has", not "delete it".
     if [ "${#FORGET[@]}" -gt 0 ] && printf '%s\n' "${FORGET[@]}" | grep -qxF "$var"; then
-      printf '%s' "$current" | jq -e --arg n "$var" '.[]? | select(.name==$n)' >/dev/null 2>&1 \
+      printf '%s' "$current" | json_has --arg n "$var" '.[]? | select(.name==$n)' \
         && ok "$var will be removed from the shared config"
       continue
     fi
@@ -339,7 +350,7 @@ prune_shadowing_env() {
   for key in VM_AGENT_SSH_KEY_B64 "${SHARED_SETTINGS[@]}" "${SHARED_SECRETS[@]}"; do
     $PER_VM_KEY && [ "$key" = VM_AGENT_SSH_KEY_B64 ] && continue
     if clever env --format json --alias "$alias" 2>/dev/null \
-        | jq -e --arg k "$key" '.env[]? | select(.name==$k)' >/dev/null 2>&1; then
+        | json_has --arg k "$key" '.env[]? | select(.name==$k)'; then
       clever env rm "$key" --alias "$alias" >/dev/null 2>&1 \
         && ok "removed $key from app env (now provided by $CONFIG_ADDON)"
     fi
