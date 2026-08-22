@@ -17,8 +17,14 @@
 #   ./provision.sh --list                    show the fleet
 #   ./provision.sh --destroy agent-3 --yes   tear one down
 #   ./provision.sh --destroy --all --yes     tear the whole fleet down
+#   ./provision.sh --destroy --all --purge --yes   ... and the shared add-ons
 #   ./provision.sh --all --forget OPENAI_API_KEY   drop a shared secret
 #
+#   --org <id|name>   deploy into an organisation instead of your personal
+#                     space; persisted in fleet.conf, so it is asked once
+#   --purge   with --destroy --all: also delete the Cellar bucket, the FS
+#             Bucket and the Configuration provider. They outlive the VMs
+#             otherwise, and so does everything the agents stored on them.
 #   --force   deploy even while agents are working (kills their panes)
 set -uo pipefail
 
@@ -49,6 +55,11 @@ FS_ADDON="${FS_ADDON:-vm-agent-fs}"
 FORGET=()
 FORCE=false
 DESTROY_ALL=false
+PURGE=false
+# Empty means the personal space - which is exactly what clever does when
+# no --org is passed, so the flag is simply absent rather than defaulted.
+CLEVER_ORG="${CLEVER_ORG:-}"
+ORG_ARGS=()
 GIT_NAME="${GIT_USER_NAME:-vm-agent}"
 GIT_EMAIL="${GIT_USER_EMAIL:-vm-agent@clever-cloud.local}"
 SIGN_COMMITS="${GIT_SIGN_COMMITS:-false}"
@@ -67,17 +78,17 @@ hdr()  { printf '\n\033[1m%s\033[0m\n' "$*"; }
 need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed"; }
 
 app_id_by_name() {
-  clever applications list --format json 2>/dev/null \
+  clever applications list ${ORG_ARGS[@]+"${ORG_ARGS[@]}"} --format json 2>/dev/null \
     | jq -r --arg n "$1" '.[].applications[]? | select(.name==$n) | .app_id' | head -1
 }
 
 addon_id_by_name() {
-  clever addon list --format json 2>/dev/null \
+  clever addon list ${ORG_ARGS[@]+"${ORG_ARGS[@]}"} --format json 2>/dev/null \
     | jq -r --arg n "$1" '.[] | select(.name==$n) | .addonId' | head -1
 }
 
 addon_real_id_by_name() {
-  clever addon list --format json 2>/dev/null \
+  clever addon list ${ORG_ARGS[@]+"${ORG_ARGS[@]}"} --format json 2>/dev/null \
     | jq -r --arg n "$1" '.[] | select(.name==$n) | .realId' | head -1
 }
 
@@ -140,7 +151,8 @@ ensure_shared_addon() {
   id="$(addon_id_by_name "$name")"
   if [ -z "$id" ]; then
     say "creating $provider add-on $name" >&2
-    out="$(clever addon create "$provider" "$name" --plan "$plan" --region "$REGION" --format json 2>&1)"
+    out="$(clever addon create "$provider" "$name" --plan "$plan" \
+      ${ORG_ARGS[@]+"${ORG_ARGS[@]}"} --region "$REGION" --format json 2>&1)"
     id="$(addon_id_by_name "$name")"
     if [ -z "$id" ]; then
       printf '%s\n' "$out" | tail -5 >&2
@@ -168,7 +180,7 @@ link_addon() {
 warn_stray_storage() {
   local alias="$1" linked catalogue stray
   linked="$(clever service --only-addons --format json --alias "$alias" 2>/dev/null)"
-  catalogue="$(clever addon list --format json 2>/dev/null)"
+  catalogue="$(clever addon list ${ORG_ARGS[@]+"${ORG_ARGS[@]}"} --format json 2>/dev/null)"
   [ -n "$linked" ] && [ -n "$catalogue" ] || return 0
 
   stray="$(jq -rn \
@@ -270,6 +282,7 @@ ensure_config_provider() {
   if [ -z "$id" ]; then
     say "creating Configuration provider $CONFIG_ADDON" >&2
     out="$(clever addon create config-provider "$CONFIG_ADDON" --plan std \
+      ${ORG_ARGS[@]+"${ORG_ARGS[@]}"} \
       --region "$REGION" --format json 2>&1)"
     id="$(addon_real_id_by_name "$CONFIG_ADDON")"
     if [ -z "$id" ]; then
@@ -382,7 +395,8 @@ provision_one() {
   app_id="$(app_id_by_name "$name")"
   if [ -z "$app_id" ]; then
     say "creating application (linux, $REGION)"
-    out="$(clever create --type linux "$name" --region "$REGION" --alias "$name" 2>&1)"
+    out="$(clever create --type linux "$name" ${ORG_ARGS[@]+"${ORG_ARGS[@]}"} \
+      --region "$REGION" --alias "$name" 2>&1)"
     app_id="$(app_id_by_name "$name")"
     if [ -z "$app_id" ]; then
       printf '%s\n' "$out" | tail -5
@@ -396,7 +410,7 @@ provision_one() {
   if is_linked_locally "$app_id"; then
     skip "already linked to this repo"
   else
-    clever link "$app_id" --alias "$name" >/dev/null 2>&1
+    clever link "$app_id" ${ORG_ARGS[@]+"${ORG_ARGS[@]}"} --alias "$name" >/dev/null 2>&1
     is_linked_locally "$app_id" && ok "linked to this repo" \
       || die "could not link $name to this repo"
   fi
@@ -521,6 +535,27 @@ do_list() {
   done < "$FLEET_FILE"
 }
 
+# The shared add-ons belong to the whole fleet, so this is only ever safe
+# once every VM is gone - hence --destroy --all only.
+purge_shared_addons() {
+  hdr "shared add-ons"
+  local name id
+  for name in "$CELLAR_ADDON" "$FS_ADDON" "$CONFIG_ADDON"; do
+    id="$(addon_id_by_name "$name")"
+    if [ -z "$id" ]; then
+      skip "$name does not exist"
+    elif clever addon delete "$id" ${ORG_ARGS[@]+"${ORG_ARGS[@]}"} --yes >/dev/null 2>&1; then
+      ok "deleted $name"
+    else
+      say "could not delete $name - remove it from the console"
+    fi
+  done
+  # The local roster now names a fleet whose storage and secrets are gone.
+  [ -f "$SECRETS_DIR/fleet.env" ] && rm -f "$SECRETS_DIR/fleet.env" \
+    && skip "removed .secrets/fleet.env"
+  return 0
+}
+
 do_destroy() {
   local name="$1" confirmed="$2"
   $confirmed || die "refusing to destroy $name without --yes"
@@ -528,8 +563,12 @@ do_destroy() {
   # Storage and configuration are fleet-wide; only the application goes.
   # The VM's subtree on the FS Bucket is left in place - deleting an app
   # should not silently destroy whatever was still in its workspace.
-  skip "shared add-ons ($CELLAR_ADDON, $FS_ADDON, $CONFIG_ADDON) left alone"
-  say "its data stays at vms/$name on the FS Bucket; remove it by hand if you want it gone"
+  if $PURGE; then
+    skip "shared add-ons go once every VM is down"
+  else
+    skip "shared add-ons ($CELLAR_ADDON, $FS_ADDON, $CONFIG_ADDON) survive - --purge deletes them"
+  fi
+  $PURGE || say "its data stays at vms/$name on the FS Bucket; remove it by hand if you want it gone"
   if [ -n "$(app_id_by_name "$name")" ]; then
     clever delete --alias "$name" --yes >/dev/null 2>&1 && ok "deleted application $name"
   else
@@ -590,6 +629,7 @@ while [ $# -gt 0 ]; do
     --fs)       FS_ADDON="$2"; shift 2 ;;
     --config)   CONFIG_ADDON="$2"; shift 2 ;;
     --forget)   FORGET+=("$2"); shift 2 ;;
+    --org|--owner) CLEVER_ORG="$2"; shift 2 ;;
     --key)      KEY_PATH="$2"; shift 2 ;;
     --per-vm-key) PER_VM_KEY=true; shift ;;
     --no-deploy)  DEPLOY=false; shift ;;
@@ -605,6 +645,7 @@ while [ $# -gt 0 ]; do
                 esac ;;
     --yes|-y)   CONFIRMED=true; shift ;;
     --force)    FORCE=true; shift ;;
+    --purge)    PURGE=true; shift ;;
     -h|--help)  usage ;;
     -*)         die "unknown option: $1" ;;
     *)          NAMES+=("$1"); shift ;;
@@ -613,17 +654,48 @@ done
 
 clever profile >/dev/null 2>&1 || die "not logged in - run 'clever login' first"
 
+# Resolve --org before anything is created. clever accepts a name, but a
+# name that matches nothing is only reported once it has already made half
+# the fleet somewhere else, so check membership here and say what the real
+# choices are.
+if [ -n "$CLEVER_ORG" ]; then
+  orgs="$(clever curl -s https://api.clever-cloud.com/v2/organisations 2>/dev/null)"
+  if [ -z "$orgs" ]; then
+    say "could not list your organisations - passing --org through unchecked"
+  else
+    match="$(printf '%s' "$orgs" | jq -r --arg o "$CLEVER_ORG" \
+      '[.[] | select(.id == $o or .name == $o)] | if length == 1 then .[0].id else empty end')"
+    if [ -z "$match" ]; then
+      printf '%s\n' "$c_err  ✗ no single organisation matches '$CLEVER_ORG'. You belong to:$c_off" >&2
+      printf '%s' "$orgs" | jq -r '.[] | "      \(.id)  \(.name)"' >&2
+      exit 1
+    fi
+    ok "targeting $(printf '%s' "$orgs" | jq -r --arg o "$match" '.[] | select(.id==$o) | .name')"
+    CLEVER_ORG="$match"
+  fi
+  ORG_ARGS=(--org "$CLEVER_ORG")
+fi
+
 case "$ACTION" in
   list)    do_list ;;
   destroy)
     if $DESTROY_ALL; then
       $CONFIRMED || die "refusing to destroy the whole fleet without --yes"
-      [ -s "$FLEET_FILE" ] || die "vms.txt is empty - nothing to destroy"
-      # Snapshot the list: do_destroy rewrites vms.txt as it goes, so
-      # iterating the file directly would skip entries.
-      mapfile -t victims < "$FLEET_FILE"
-      for n in "${victims[@]}"; do [ -n "$n" ] && do_destroy "$n" true; done
+      # An empty registry is still worth running for --purge: the VMs may
+      # already be gone while their storage quietly bills on.
+      if [ -s "$FLEET_FILE" ]; then
+        # Snapshot the list: do_destroy rewrites vms.txt as it goes, so
+        # iterating the file directly would skip entries.
+        mapfile -t victims < "$FLEET_FILE"
+        for n in "${victims[@]}"; do [ -n "$n" ] && do_destroy "$n" true; done
+      elif ! $PURGE; then
+        die "vms.txt is empty - nothing to destroy"
+      else
+        skip "no VMs in vms.txt - purging the shared add-ons only"
+      fi
+      $PURGE && purge_shared_addons
     else
+      $PURGE && die "--purge deletes fleet-wide storage; it needs --destroy --all"
       do_destroy "${NAMES[0]}" "$CONFIRMED"
     fi ;;
   all|provision)

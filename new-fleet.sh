@@ -111,16 +111,74 @@ if [ "$EXISTING" -gt 0 ]; then
   while read -r n; do [ -n "$n" ] && note "$n"; done < "$FLEET_FILE"
   printf '\n'
   note "vms.txt tracks one fleet per checkout, so these VMs and the new"
-  note "ones share it. Tear them down first for a genuinely clean slate."
+  note "ones share it. Tear them down first to start clean."
   printf '\n'
   if ask_yn "destroy the existing fleet before building the new one?" n; then
     printf '  %stype the word %sdestroy%s to confirm:%s ' "$c_warn" "$c_b" "$c_warn" "$c_off"
     IFS= read -r confirm || die "input closed"
     [ "$confirm" = destroy ] || die "not confirmed - nothing was destroyed"
-    "$ROOT/provision.sh" --destroy --all --yes || die "teardown failed - stopping here"
+    # Deleting the applications leaves the Cellar bucket, the FS Bucket and
+    # the config provider behind - they are fleet-wide, so no single VM
+    # teardown may take them. They also keep billing, so ask outright.
+    PURGE_ARGS=()
+    printf '\n'
+    note "the Cellar bucket, the FS Bucket and the config provider are"
+    note "fleet-wide: deleting the VMs leaves them behind, still billing."
+    note "Deleting them also destroys what the agents stored - workspaces,"
+    note "snapshots, uploaded files - and the fleet's shared secrets."
+    printf '\n'
+    if ask_yn "also delete the shared storage and secrets?" n; then
+      PURGE_ARGS=(--purge)
+      warn "the agents' stored data goes with them"
+    else
+      skip "keeping them - a new fleet of the same name reuses them"
+    fi
+    "$ROOT/provision.sh" --destroy --all ${PURGE_ARGS[@]+"${PURGE_ARGS[@]}"} --yes \
+      || die "teardown failed - stopping here"
     EXISTING=0
   else
     skip "keeping them - the new VMs will join this fleet"
+  fi
+fi
+
+# ---------------------------------------------------------- organisation
+# clever targets your personal space when no --org is passed, so choosing
+# it means storing nothing rather than storing the user id.
+CLEVER_ORG="${CLEVER_ORG:-}"
+ORG_LABEL=""
+if [ "$EXISTING" -eq 0 ]; then
+  hdr "organisation"
+  orgs="$(clever curl -s https://api.clever-cloud.com/v2/organisations 2>/dev/null)"
+  self_id="$(clever curl -s https://api.clever-cloud.com/v2/self 2>/dev/null | jq -r '.id // empty')"
+  if [ -z "$orgs" ] || ! printf '%s' "$orgs" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    warn "could not list your organisations - using your personal space"
+    CLEVER_ORG=""
+  elif [ "$(printf '%s' "$orgs" | jq 'length')" -le 1 ]; then
+    skip "personal space (the only one you belong to)"
+    CLEVER_ORG=""
+  else
+    note "the applications and the three shared add-ons are all created here."
+    # Personal space first, so the default is the safe one.
+    mapfile -t org_ids   < <(printf '%s' "$orgs" | jq -r --arg s "$self_id" 'sort_by(.id != $s) | .[].id')
+    mapfile -t org_names < <(printf '%s' "$orgs" | jq -r --arg s "$self_id" 'sort_by(.id != $s) | .[].name')
+    printf '\n'
+    for i in "${!org_ids[@]}"; do
+      printf '  %s%d)%s %-30s %s%s%s\n' \
+        "$c_b" "$((i + 1))" "$c_off" "${org_names[$i]}" "$c_dim" "${org_ids[$i]}" "$c_off"
+    done
+    printf '\n'
+    while :; do
+      ask pick "organisation" 1
+      case "$pick" in ''|*[!0-9]*) warn "enter one of the numbers above"; continue ;; esac
+      if [ "$pick" -lt 1 ] || [ "$pick" -gt "${#org_ids[@]}" ]; then
+        warn "there is no option $pick"; continue
+      fi
+      break
+    done
+    ORG_LABEL="${org_names[$((pick - 1))]}"
+    if [ "${org_ids[$((pick - 1))]}" = "$self_id" ]; then CLEVER_ORG=""
+    else CLEVER_ORG="${org_ids[$((pick - 1))]}"; fi
+    ok "$ORG_LABEL"
   fi
 fi
 
@@ -284,6 +342,7 @@ fi
 
 # ---------------------------------------------------------------- review
 hdr "review"
+printf '  %-22s %s\n' "organisation"     "${ORG_LABEL:-${CLEVER_ORG:-Personal space}}"
 printf '  %-22s %s\n' "fleet"            "$FLEET_NAME"
 printf '  %-22s %s\n' "VMs"             "$VM_LIST"
 printf '  %-22s %s\n' "size / region"   "$FLAVOR / $REGION"
@@ -323,6 +382,13 @@ mkdir -p "$SECRETS_DIR"; chmod 700 "$SECRETS_DIR"
   printf ': "${FLAVOR:=%s}"\n' "$FLAVOR"
   printf ': "${REGION:=%s}"\n' "$REGION"
   echo
+  # Empty means the personal space, so write nothing rather than pinning
+  # the fleet to a user id that reads like an organisation.
+  [ -n "$CLEVER_ORG" ] && {
+    echo "# Organisation owning the applications and add-ons."
+    printf ': "${CLEVER_ORG:=%s}"\n' "$CLEVER_ORG"
+    echo
+  }
   echo "# The shared add-ons are looked up by name; these keep this fleet"
   echo "# separate from any other one in the same organisation."
   printf ': "${FLEET_NAME:=%s}"\n'    "$FLEET_NAME"

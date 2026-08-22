@@ -16,8 +16,8 @@ working while nobody is attached.
 ## Quick start
 
 `new-fleet.sh` is the guided path from nothing to a running fleet. It asks
-for a fleet name, your commit identity, the agent and forge tokens and how
-many VMs you want; validates the GitHub and GitLab tokens against their
+which organisation to build in, a fleet name, your commit identity, the
+agent and forge tokens and how many VMs you want; validates the GitHub and GitLab tokens against their
 APIs before you find out the hard way; writes `fleet.conf` and
 `.secrets/tokens.env`; generates the commit key and registers it on your
 forges; then hands over to `provision.sh`.
@@ -49,8 +49,20 @@ partial failure resumes where it stopped.
 ./provision.sh agent --count 4         # agent-1 .. agent-4, running in parallel
 ./provision.sh --all                   # re-apply to every VM in vms.txt
 ./provision.sh --list                  # fleet overview
-./provision.sh --destroy agent-3 --yes # tear one down, add-ons included
+./provision.sh --destroy agent-3 --yes # tear one VM down
+./provision.sh --destroy --all --purge --yes   # ... and the shared add-ons
 ```
+
+Everything lands in your personal space unless you say otherwise.
+`--org <id|name>` targets an organisation instead, and is checked against
+the ones you actually belong to before anything is created:
+
+```bash
+./provision.sh agent --count 2 --org "Acme Corp"
+```
+
+`new-fleet.sh` asks once and records it in `fleet.conf`, so the rest of
+the commands need no flag.
 
 Each VM gets its own application. Storage is **shared across the fleet** —
 one Cellar add-on and one FS Bucket, linked to every app — because N idle
@@ -145,6 +157,13 @@ is the way to change one afterwards.
 ./agent-tokens.sh set OPENAI_API_KEY   # hidden prompt for any supported key
 ./provision.sh --all --no-deploy       # apply to the fleet
 ```
+
+Deleting a VM leaves the shared add-ons alone, because they belong to the
+whole fleet — which also means `--destroy --all` on its own leaves the
+Cellar bucket, the FS Bucket and the config provider running and billing.
+`--purge` takes them too, along with everything the agents stored on them.
+It only works with `--destroy --all`, since no single VM may delete
+storage its neighbours are using.
 
 Removing a secret needs `--forget`, because an empty local value means
 "keep whatever the provider has" rather than "delete it":
