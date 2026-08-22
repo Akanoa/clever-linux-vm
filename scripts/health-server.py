@@ -59,6 +59,53 @@ def herdr(*args, timeout=30):
         }
 
 
+AGENT_KINDS = {
+    "pi", "claude", "codex", "gemini", "cursor", "devin", "agy", "cline",
+    "omp", "mastracode", "opencode", "copilot", "kimi", "kiro", "droid",
+    "amp", "grok", "hermes", "kilo", "qodercli", "qwen", "maki",
+}
+
+
+def start_agent(name, kind, cwd, label):
+    """Create a pane and launch an agent in it.
+
+    A headless server starts with no workspace at all, so the first agent
+    has to create one; later ones get a tab in the existing workspace.
+    Both calls return the new pane under .result.root_pane.
+    """
+    code, listing = herdr("workspace", "list")
+    if code != 200:
+        return code, listing
+    workspaces = (listing.get("result") or {}).get("workspaces") or []
+
+    if workspaces:
+        code, made = herdr("tab", "create", "--workspace",
+                           workspaces[0]["workspace_id"], "--cwd", cwd,
+                           "--label", label)
+    else:
+        code, made = herdr("workspace", "create", "--cwd", cwd, "--label", label)
+    if code != 200:
+        return code, made
+
+    pane = ((made.get("result") or {}).get("root_pane") or {}).get("pane_id")
+    if not pane:
+        return 500, {"error": "could not determine the new pane", "response": made}
+
+    # `agent start` reports agent_not_ready if the CLI is still drawing its
+    # welcome screen when the readiness check fires - that is not a failure,
+    # so settle for whatever state the agent has actually reached.
+    start_code, started = herdr("agent", "start", name, "--kind", kind,
+                                "--pane", pane, "--timeout", "60000",
+                                timeout=120)
+    _, got = herdr("agent", "get", name)
+    agent = (got.get("result") or {}).get("agent") or {}
+    if agent.get("interactive_ready"):
+        return 200, {"started": True, "pane": pane, "agent": agent}
+    return 202, {"started": False, "pane": pane, "agent": agent,
+                 "start_response": started, "start_code": start_code,
+                 "hint": "agent is not interactive yet; poll GET /agents/<name>"}
+
+
 def read_stage():
     try:
         with open(STATE_FILE) as fh:
@@ -207,6 +254,22 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body()
         if body is None or not isinstance(body, dict):
             return self._json(400, {"error": "expected a JSON object body"})
+
+        if parts == ["agents"]:
+            name = body.get("name")
+            kind = body.get("kind", "claude")
+            if not isinstance(name, str) or not name.replace("-", "").replace("_", "").isalnum():
+                return self._json(400, {"error": "'name' must be alphanumeric (- and _ allowed)"})
+            if kind not in AGENT_KINDS:
+                return self._json(400, {"error": f"unsupported kind: {kind}",
+                                        "supported": sorted(AGENT_KINDS)})
+            cwd = body.get("cwd") or os.path.join(HOME, "workspace")
+            if not isinstance(cwd, str) or not os.path.isdir(cwd):
+                return self._json(400, {"error": f"cwd is not a directory: {cwd}"})
+            label = body.get("label") or name
+            if not isinstance(label, str):
+                return self._json(400, {"error": "'label' must be a string"})
+            return self._json(*start_agent(name, kind, cwd, label))
 
         if len(parts) == 3 and parts[0] == "agents" and parts[2] == "prompt":
             text = body.get("text")

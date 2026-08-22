@@ -8,6 +8,7 @@
 # token. Arbitrary ports are not reachable VM-to-VM, public or private.
 #
 #   fleet status                     one line per VM
+#   fleet start <vm> <name> [kind]   launch an agent in a fresh pane
 #   fleet agents                     every agent on every box
 #   fleet read <vm>/<agent>          recent terminal output
 #   fleet prompt <vm>/<agent> "..."  submit a prompt
@@ -99,6 +100,13 @@ cmd_agents() {
 case "${1:-status}" in
   status) cmd_status ;;
   agents) cmd_agents ;;
+  start)
+    vm="${2:?usage: fleet start <vm> <name> [kind] [cwd]}"
+    name="${3:?usage: fleet start <vm> <name> [kind] [cwd]}"
+    body="$(jq -nc --arg n "$name" --arg k "${4:-claude}" \
+      --arg c "${5:-}" '{name:$n, kind:$k} + (if $c == "" then {} else {cwd:$c} end)')"
+    call POST "$vm" /agents "$body" \
+      | jq '{started, pane, status: .agent.agent_status, ready: .agent.interactive_ready, hint}' ;;
   read)
     split_target "${2:?usage: fleet read <vm>/<agent>}"
     call GET "$TGT_VM" "/agents/$TGT_AGENT/read?source=${3:-recent}" \
