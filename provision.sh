@@ -375,17 +375,28 @@ provision_one() {
 
   # --- deploy -----------------------------------------------------------
   if $DEPLOY; then
-    say "deploying"
-    local out
-    out="$(clever deploy --alias "$name" 2>&1)"
-    if printf '%s' "$out" | grep -qiE 'up.to.date|already deployed|nothing to (push|commit)'; then
-      skip "already at this commit - restarting to apply env changes"
-      clever restart --alias "$name" >/dev/null 2>&1 && ok "restarted"
-    elif printf '%s' "$out" | grep -qi 'Deployment failed'; then
-      printf '%s\n' "$out" | tail -20
-      die "deployment failed for $name"
+    local want out got
+    want="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
+    got="$(clever status --alias "$name" --format json 2>/dev/null | jq -r '.commit // ""')"
+
+    if [ -n "$want" ] && [ "$want" = "$got" ]; then
+      skip "already running $(printf '%.7s' "$want")"
     else
-      ok "deployed"
+      say "deploying $(printf '%.7s' "$want")"
+      # --force: the Clever remote is a deploy target, not a source of
+      # truth, so a rewritten local history must win. --same-commit-policy
+      # restart makes a no-op deploy pick up changed environment instead
+      # of erroring.
+      out="$(clever deploy --alias "$name" --force --same-commit-policy restart 2>&1)"
+
+      # Judge by the commit the platform reports, not by the exit code or
+      # by grepping the log: a rejected push once slipped through both.
+      got="$(clever status --alias "$name" --format json 2>/dev/null | jq -r '.commit // ""')"
+      if [ -n "$want" ] && [ "$want" != "$got" ]; then
+        printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g' | tail -15
+        die "$name is running ${got:-nothing}, expected $want"
+      fi
+      ok "deployed $(printf '%.7s' "$want")"
     fi
   else
     skip "deploy skipped (--no-deploy)"
