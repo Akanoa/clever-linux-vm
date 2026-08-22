@@ -53,6 +53,20 @@ partial failure resumes where it stopped.
 ./provision.sh --destroy --all --purge --yes   # ... and the shared add-ons
 ```
 
+`--flavor` sizes the VMs — `pico nano XS S M L XL 2XL 3XL` on the `linux`
+runtime — and applies to every VM the run touches:
+
+```bash
+./provision.sh big-agent --flavor L    # create it large
+./provision.sh --all --flavor S        # shrink the whole fleet
+```
+
+A flavor asked for on the command line (or in the environment) is an
+order. The `FLAVOR` in `fleet.conf` is only the default for VMs that do
+not exist yet, so re-running `--all` never quietly resizes a box you
+scaled up on purpose — it tells you the flag to use instead. An unusable
+flavor is rejected before anything is created.
+
 Everything lands in your personal space unless you say otherwise.
 `--org <id|name>` targets an organisation instead, and is checked against
 the ones you actually belong to before anything is created:

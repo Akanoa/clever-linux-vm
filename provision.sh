@@ -20,8 +20,21 @@
 #   ./provision.sh --destroy --all --purge --yes   ... and the shared add-ons
 #   ./provision.sh --all --forget OPENAI_API_KEY   drop a shared secret
 #
+# Options
+#   --flavor <size>   pico nano XS S M L XL 2XL 3XL - the VM size. Applies
+#                     to every VM this run touches, so `--all --flavor L`
+#                     resizes the fleet. The lasting default lives in
+#                     fleet.conf; without it, an existing VM keeps its own.
+#   --count <n>       with a bare name: create <name>-1 .. <name>-n
+#   --region <zone>   par, grahq, mtl, sgp, syd, wsw (default par)
 #   --org <id|name>   deploy into an organisation instead of your personal
 #                     space; persisted in fleet.conf, so it is asked once
+#   --no-deploy       apply configuration, but do not push code
+#   --key <path>      commit key to use (default .secrets/id_ed25519)
+#   --per-vm-key      give each VM its own commit key instead of sharing one
+#   --cellar/--fs/--config <name>   override a shared add-on name
+#   --forget <VAR>    delete a secret from the shared configuration
+#   --yes, -y         do not ask before destroying
 #   --purge   with --destroy --all: also delete the Cellar bucket, the FS
 #             Bucket and the Configuration provider. They outlive the VMs
 #             otherwise, and so does everything the agents stored on them.
@@ -32,6 +45,13 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SECRETS_DIR="$ROOT/.secrets"
 FLEET_FILE="$ROOT/vms.txt"
+# Read before fleet.conf can set it: FLAVOR arriving from the environment
+# means "resize to this", while the same value out of fleet.conf is only a
+# default for VMs that do not exist yet. Sourcing first would make the two
+# indistinguishable.
+FLAVOR_EXPLICIT=false
+[ -n "${FLAVOR:-}" ] && FLAVOR_EXPLICIT=true
+
 # fleet.conf holds the non-secret fleet settings (identity, size, region)
 # and is committed. Anything already in the environment wins over it, so a
 # one-off `FLAVOR=L ./provision.sh ...` still works.
@@ -431,8 +451,14 @@ provision_one() {
 
   if [ "$current_flavor" = "$FLAVOR" ]; then
     skip "flavor already $FLAVOR"
+  elif [ -n "$current_flavor" ] && ! $FLAVOR_EXPLICIT; then
+    # An existing VM keeps the size it was given. fleet.conf sets the size
+    # of new VMs; resizing an old one is something you ask for.
+    skip "flavor $current_flavor - use --flavor $FLAVOR to change it"
+  elif clever scale --flavor "$FLAVOR" --alias "$name" >/dev/null 2>&1; then
+    ok "scaled to $FLAVOR"
   else
-    clever scale --flavor "$FLAVOR" --alias "$name" >/dev/null 2>&1 && ok "scaled to $FLAVOR"
+    die "could not scale $name to $FLAVOR"
   fi
 
   if [ "$instance_count" = "1" ] && [ "$h_max" = "1" ]; then
@@ -622,7 +648,7 @@ need clever; need jq; need ssh-keygen; need base64
 NAMES=(); ACTION="provision"; CONFIRMED=false
 while [ $# -gt 0 ]; do
   case "$1" in
-    --flavor)   FLAVOR="$2"; shift 2 ;;
+    --flavor)   FLAVOR="$2"; FLAVOR_EXPLICIT=true; shift 2 ;;
     --region)   REGION="$2"; shift 2 ;;
     --count)    COUNT="$2"; shift 2 ;;
     --cellar)   CELLAR_ADDON="$2"; shift 2 ;;
@@ -653,6 +679,20 @@ while [ $# -gt 0 ]; do
 done
 
 clever profile >/dev/null 2>&1 || die "not logged in - run 'clever login' first"
+
+# A rejected `clever scale` used to print nothing at all - the call was
+# guarded by && with no else - leaving the VM at whatever size it already
+# had and the run looking clean. Catch a bad flavor before anything is
+# created, against what the linux runtime actually offers.
+if [ "$ACTION" = provision ] || [ "$ACTION" = all ]; then
+  FLAVORS="$(clever curl -s https://api.clever-cloud.com/v2/products/instances 2>/dev/null \
+    | jq -r '.[] | select(.variant.slug == "linux") | .flavors[].name' 2>/dev/null | paste -sd' ')"
+  [ -n "$FLAVORS" ] || FLAVORS="pico nano XS S M L XL 2XL 3XL"
+  # Accept a lowercase 'xl' and hand clever the spelling it wants.
+  canon="$(printf '%s\n' $FLAVORS | grep -ixF -- "$FLAVOR" | head -1)"
+  [ -n "$canon" ] || die "unknown flavor '$FLAVOR' - pick one of: $FLAVORS"
+  FLAVOR="$canon"
+fi
 
 # Resolve --org before anything is created. clever accepts a name, but a
 # name that matches nothing is only reported once it has already made half

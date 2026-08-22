@@ -262,7 +262,8 @@ case "$AGENT_BASE" in *[!a-z0-9-]*|"") die "VM names must be lowercase letters, 
 
 hdr "machine size"
 note "S is enough to drive an agent; M gives builds and tests room."
-ask FLAVOR "flavor (S, M, L, XL)" "${FLAVOR:-M}"
+note "pico nano XS S M L XL 2XL 3XL - provision.sh rejects anything else."
+ask FLAVOR "flavor" "${FLAVOR:-M}"
 ask REGION "region (par, grahq, mtl, sgp, syd, wsw)" "${REGION:-par}"
 
 hdr "agent autonomy"
