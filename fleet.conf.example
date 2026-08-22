@@ -14,6 +14,14 @@
 : "${GIT_USER_EMAIL:=you@example.com}"
 : "${GIT_SIGN_COMMITS:=true}"
 
+# How much a pane agent may do without a human approving each step:
+#   default | acceptEdits | bypassPermissions
+# Agents launched through `fleet start` have nobody at the keyboard, so
+# anything stricter than acceptEdits will wedge them on the first command.
+# bypassPermissions removes the gate entirely - note the VM holds your
+# GitLab token and a commit key with push rights.
+: "${CLAUDE_PERMISSION_MODE:=acceptEdits}"
+
 # gitlab.com, or the host of a self-managed instance.
 : "${GITLAB_HOST:=gitlab.com}"
 

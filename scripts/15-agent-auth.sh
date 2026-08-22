@@ -78,6 +78,49 @@ else:
 PYEOF
 }
 
+# How much a pane agent may do without asking. An agent launched through
+# the fleet endpoint has nobody at the keyboard, so a permission prompt
+# just wedges it - `fleet keys <vm>/<agent> 1` is a workaround, not a
+# workflow. Set CLAUDE_PERMISSION_MODE in fleet.conf:
+#   default          ask for everything (interactive use)
+#   acceptEdits      auto-approve file edits, still ask before commands
+#   bypassPermissions run unattended - no prompts at all
+seed_claude_permissions() {
+  local mode="${CLAUDE_PERMISSION_MODE:-acceptEdits}"
+  case "$mode" in
+    default|acceptEdits|bypassPermissions|plan) ;;
+    *) log "claude: ignoring unknown CLAUDE_PERMISSION_MODE '$mode'"; return 0 ;;
+  esac
+  mkdir -p "$HOME/.claude"
+  CLAUDE_SETTINGS="$HOME/.claude/settings.json" CLAUDE_MODE="$mode" python3 - <<'PYEOF'
+import json, os
+
+path = os.environ["CLAUDE_SETTINGS"]
+mode = os.environ["CLAUDE_MODE"]
+try:
+    with open(path) as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        data = {}
+except (OSError, ValueError):
+    data = {}
+
+perms = data.setdefault("permissions", {})
+if not isinstance(perms, dict):
+    perms = data["permissions"] = {}
+
+if perms.get("defaultMode") == mode:
+    print(f"claude: permission mode already {mode}")
+else:
+    perms["defaultMode"] = mode
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, path)
+    print(f"claude: permission mode set to {mode}")
+PYEOF
+}
+
 claude_auth() {
   if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
     log "claude: long-lived subscription token $(mask "$CLAUDE_CODE_OAUTH_TOKEN")"
@@ -126,6 +169,7 @@ opencode_auth() {
 }
 
 seed_claude_onboarding 2>&1 | sed 's/^/[vm-agent] /' || true
+seed_claude_permissions 2>&1 | sed 's/^/[vm-agent] /' || true
 claude_auth   || true
 codex_auth    || true
 opencode_auth || true

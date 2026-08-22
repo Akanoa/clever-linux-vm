@@ -47,6 +47,7 @@ GIT_NAME="${GIT_USER_NAME:-vm-agent}"
 GIT_EMAIL="${GIT_USER_EMAIL:-vm-agent@clever-cloud.local}"
 SIGN_COMMITS="${GIT_SIGN_COMMITS:-false}"
 GITLAB_HOST_VALUE="${GITLAB_HOST:-gitlab.com}"
+CLAUDE_PERMISSION_MODE_VALUE="${CLAUDE_PERMISSION_MODE:-acceptEdits}"
 
 # ---------------------------------------------------------------- output
 c_ok=$'\033[32m'; c_skip=$'\033[2m'; c_do=$'\033[36m'; c_err=$'\033[31m'; c_off=$'\033[0m'
@@ -245,7 +246,7 @@ SHARED_SECRETS=(
   CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY
 )
 # Non-secret settings, always taken from the local configuration.
-SHARED_SETTINGS=(GITLAB_HOST GIT_USER_NAME GIT_USER_EMAIL GIT_SIGN_COMMITS CELLAR_BUCKET VM_AGENT_FLEET)
+SHARED_SETTINGS=(GITLAB_HOST GIT_USER_NAME GIT_USER_EMAIL GIT_SIGN_COMMITS CELLAR_BUCKET VM_AGENT_FLEET CLAUDE_PERMISSION_MODE)
 
 # Writes the fleet-wide variables. Changing a value restarts every linked app.
 sync_shared_config() {
@@ -267,6 +268,7 @@ sync_shared_config() {
   add_var GIT_SIGN_COMMITS "$SIGN_COMMITS"
   add_var CELLAR_BUCKET    "$CELLAR_BUCKET_NAME"
   add_var VM_AGENT_FLEET   "$FLEET_ROSTER"
+  add_var CLAUDE_PERMISSION_MODE "$CLAUDE_PERMISSION_MODE_VALUE"
 
   for var in "${SHARED_SECRETS[@]}"; do
     # --forget is the only way to take a secret back out: an empty local
