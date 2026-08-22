@@ -46,10 +46,16 @@ So:
 - If you lose it, \`moerae convs -p PROJECT\` lists the ids - that is the only
   way back to your own memory.
 
-**Run one \`put\` per shell command.** Chaining several in a single invocation
-was observed to fail partway with exit 1 and *no output*, after the first
-one had already written - which silently duplicates nodes. Keep puts under
-a few hundred characters, and check \`\$?\`: failures here are silent.
+**\`put\` has a token limit, and failures are currently silent.** Content over
+~128 indexable tokens is rejected with exit 1 and - until
+[Moerae-AI/Moerae#3](https://github.com/Moerae-AI/Moerae/issues/3) is merged -
+*no message at all*, because the CLI redirects stderr to /dev/null and never
+restores it. So:
+
+- Keep a \`put\` to roughly a paragraph, or pass \`-m/--metadata\` for large content.
+- Always check \`\$?\`. A silent success and a silent failure look identical.
+- Chaining puts with \`&&\` is fine. If a chain stops early it is because one of
+  them hit the token limit, not because chaining is broken.
 
 Use \`-p\` per project/repo. First use downloads a ~300MB embedding model
 (~12s); the model is deliberately not persisted, the memory is.
