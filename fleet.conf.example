@@ -25,6 +25,11 @@
 # gitlab.com, or the host of a self-managed instance.
 : "${GITLAB_HOST:=gitlab.com}"
 
+# Cellar bucket for large files. Leave unset and it is derived from the
+# add-on id - names are globally unique across Cellar, so a friendly one
+# can collide with another tenant's.
+# : "${CELLAR_BUCKET_NAME:=my-unique-bucket}"
+
 # Default size and region for new VMs.
 : "${FLAVOR:=M}"
 : "${REGION:=par}"
