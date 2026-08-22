@@ -142,6 +142,52 @@ restarts. `/status` reports what each agent found:
 "agent_auth": { "claude": "subscription-token", "codex": null, "opencode": ["anthropic"] }
 ```
 
+## Fleet federation
+
+herdr has no federation — `herdr --remote` errors with *"can only be
+specified once"* — and Clever Cloud routes **no port but 8080** between
+instances, not even on the private address (verified: a listener on 4040
+is unreachable both ways). So the health server doubles as the inter-VM
+channel, over the URL the platform already publishes.
+
+```bash
+fleet status                       # one line per VM
+fleet agents                       # every agent on every box
+fleet start <vm> <name> [kind]     # launch an agent in a fresh pane
+fleet prompt <vm>/<name> "..."     # submit a prompt
+fleet read <vm>/<name>             # recent terminal output
+fleet keys <vm>/<name> 1           # answer a prompt the agent is blocked on
+```
+
+It runs on the VMs (agents can drive each other) and on your laptop, where
+`provision.sh` writes the roster and token to `.secrets/fleet.env`.
+
+| Endpoint | |
+|---|---|
+| `GET /` | unauthenticated — the platform's health probe |
+| `GET /status`, `/logs` | |
+| `GET /agents`, `/agents/<n>`, `/agents/<n>/read` | |
+| `POST /agents` | create a pane and launch an agent |
+| `POST /agents/<n>/prompt`, `/agents/<n>/keys` | |
+
+Everything but `/` needs `Authorization: Bearer $VM_AGENT_FLEET_TOKEN`,
+minted by `provision.sh` into the config provider. It **fails closed**: with
+no token configured nothing but `/` answers, so a half-provisioned box never
+exposes its logs to the internet.
+
+### Why agents in panes need seeding
+
+A pane agent has nobody at the keyboard, so anything that waits for input
+wedges it. `CLAUDE_CODE_OAUTH_TOKEN` authenticates headless `claude -p` but
+does **not** suppress the interactive gates, so boot seeds them:
+
+* `hasCompletedOnboarding` — otherwise the TUI stops at the login selector
+* per-directory `hasTrustDialogAccepted` — otherwise the folder-trust prompt
+* `permissions.defaultMode` from `CLAUDE_PERMISSION_MODE`
+
+The first two live in `~/.claude.json` — a *file*, not the `~/.claude`
+directory — which is why it is snapshotted separately from the state dirs.
+
 ## Connecting
 
 ```bash
@@ -263,6 +309,7 @@ scripts/30-shell.sh        makes `clever ssh` sessions match the boot env
 scripts/40-herdr.sh        starts the headless herdr server
 tools/cellar               s3cmd wrapper for the Cellar bucket
 tools/vm-snapshot          agent state -> FS Bucket
+tools/fleet                talk to the other VMs (runs on VM and laptop)
 provision.sh               idempotent fleet provisioner (runs locally)
 agent-tokens.sh            fills .secrets/tokens.env (runs locally)
 fleet.conf.example         template for fleet.conf (gitignored)
