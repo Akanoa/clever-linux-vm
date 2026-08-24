@@ -29,7 +29,7 @@ case "${1:-}" in
     exec herdr --remote "ssh://bas@${host}:${port}"
     ;;
   ""|--ssh)
-    exec clever ssh --app "$APP"
+    exec clever ssh --app "$APP" --no-update-notifier
     ;;
   *)
     sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'

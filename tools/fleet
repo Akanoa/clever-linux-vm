@@ -182,7 +182,10 @@ case "${1:-status}" in
     command -v clever >/dev/null || die "clever is required for attach"
     sock="fleet-attach"; sess="$TGT_VM${TGT_AGENT:+-$TGT_AGENT}"
     tmux -L "$sock" kill-session -t "$sess" 2>/dev/null
-    tmux -L "$sock" new-session -d -s "$sess" "clever ssh --alias '$TGT_VM'"
+    # --no-update-notifier: clever-tools otherwise checks GitHub for a newer
+    # release on every single invocation, adding a real (and on a slow or
+    # flaky path, sometimes multi-second) delay before ssh even starts.
+    tmux -L "$sock" new-session -d -s "$sess" "clever ssh --alias '$TGT_VM' --no-update-notifier"
     # tmux's default 500ms escape-time is a wait for more bytes after a
     # lone ESC, to tell it apart from an arrow key, Home/End, an Alt+key
     # combo, or vim leaving insert mode - all of which start with ESC over

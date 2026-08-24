@@ -96,7 +96,7 @@ RCEOF
   tmux -L "$SOCKET" set-option -g status-left "#[bold] fleet demo · $VM  "
 
   tmux -L "$SOCKET" split-window -h -t "$SESSION" \
-    "clever ssh --alias '$VM'"
+    "clever ssh --alias '$VM' --no-update-notifier"
 
   say "waiting for the remote shell…"
   if wait_for_remote_prompt "$SESSION:0.1"; then
