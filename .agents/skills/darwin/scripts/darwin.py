@@ -418,6 +418,12 @@ def worktree_add(ctx: Ctx, role: str, base: str, branch: str, path: Path) -> dic
             ws = (res.get("workspace") or {}).get("workspace_id")
             extra = {"workspace_id": ws,
                      "pane_id": (res.get("root_pane") or {}).get("pane_id")}
+            # Name the pane as well as labelling it: `pane report-agent` sets the
+            # displayed agent label, but only a `name` makes the pane addressable
+            # from off the machine. Without this every darwin pane is born
+            # nameless and cannot be reached by the fleet API to be read,
+            # prompted, or unblocked.
+            herdr_name_pane(extra.get("pane_id"), ctx.run_id, role)
             # herdr also opens a workspace for the source repo if none was open;
             # remember it so `clean` does not leave it behind
             aux = [w for w in herdr_workspace_ids() - before if w != ws]
@@ -602,6 +608,27 @@ def spawn_via_herdr_agent(ctx: Ctx, role: str, wt: Path, log: Path, timeout: int
         herdr_report(ctx, role, "blocked", "darwin: agent did not settle in time")
         return 124, text or f"[darwin] TIMEOUT waiting for {name} to go idle", secs
     return 0, text, secs
+
+
+def pane_agent_name(run_id: str, role: str) -> str:
+    """A short, stable herdr `name` for a role's pane.
+
+    A pane's `name` is what addresses it from outside the box - the fleet's HTTP
+    API resolves agents by name and cannot see a nameless pane at all. herdr's
+    *reported agent label* (set by `pane report-agent`) is a separate field and
+    does not make a pane addressable, so a spawned role that is only labelled is
+    invisible to anything that is not already on the machine.
+    """
+    tail = run_id.rsplit("-", 1)[-1] or run_id
+    name = f"dw-{tail}-{role}"
+    return re.sub(r"[^A-Za-z0-9_-]", "-", name)[:32]
+
+
+def herdr_name_pane(pane: str | None, run_id: str, role: str) -> None:
+    """Give a spawned pane a name. Best-effort: never fail a run over cosmetics."""
+    if not pane:
+        return
+    herdr_json(["agent", "rename", pane, pane_agent_name(run_id, role)], timeout=30)
 
 
 def herdr_report(ctx: Ctx, role: str, state: str, message: str = ""):
