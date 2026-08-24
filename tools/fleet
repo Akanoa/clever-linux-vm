@@ -183,6 +183,12 @@ case "${1:-status}" in
     sock="fleet-attach"; sess="$TGT_VM${TGT_AGENT:+-$TGT_AGENT}"
     tmux -L "$sock" kill-session -t "$sess" 2>/dev/null
     tmux -L "$sock" new-session -d -s "$sess" "clever ssh --alias '$TGT_VM'"
+    # tmux's default 500ms escape-time is a wait for more bytes after a
+    # lone ESC, to tell it apart from an arrow key, Home/End, an Alt+key
+    # combo, or vim leaving insert mode - all of which start with ESC over
+    # SSH. Left at the default, every one of those lags by up to half a
+    # second while plain letters pass through untouched.
+    tmux -L "$sock" set-option -g escape-time 10
     tmux -L "$sock" set-option -g prefix C-a
     tmux -L "$sock" unbind-key C-b
     tmux -L "$sock" bind-key C-a send-prefix

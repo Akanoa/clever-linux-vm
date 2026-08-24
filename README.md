@@ -229,6 +229,13 @@ The prefix matters — **both herdr instances bind `ctrl+b`**, so the demo
 tmux uses `ctrl+a` and leaves `ctrl+b` to the remote herdr on the right.
 Detach the whole thing with `ctrl+a d`.
 
+It also sets `escape-time 10`, down from tmux's default 500ms. That default
+is a wait for more bytes after a lone ESC, to tell it apart from an arrow
+key, Home/End, an Alt+key combo, or vim leaving insert mode — all of which
+start with ESC over SSH. Left alone it makes exactly those keys feel
+laggy while plain letters do not, which reads as "some keystrokes are
+delayed" rather than a general slowdown.
+
 ## Fleet federation
 
 herdr has no federation — `herdr --remote` errors with *"can only be

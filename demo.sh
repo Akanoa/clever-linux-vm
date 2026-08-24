@@ -86,6 +86,9 @@ RCEOF
   tmux -L "$SOCKET" new-session -d -s "$SESSION" -x 200 -y 50 \
     "bash --rcfile '$rc'"
   # Prefix moved off ctrl+b so the remote herdr in the right pane keeps it.
+  # See tools/fleet for why this matters: tmux's default 500ms escape-time
+  # delays every ESC-prefixed key (arrows, Alt combos, vim's insert exit).
+  tmux -L "$SOCKET" set-option -g escape-time 10
   tmux -L "$SOCKET" set-option -g prefix C-a
   tmux -L "$SOCKET" unbind-key C-b
   tmux -L "$SOCKET" bind-key C-a send-prefix
