@@ -179,6 +179,9 @@ again.
 | `fleet fetch` 404s | The agent has not written `~/out/<name>.md` yet, or ignored the instruction. Check with `fleet read`. |
 | Deploy refuses | An agent is mid-task. `--force` overrides and kills its pane. |
 | Agent has no model access | No `CLAUDE_CODE_OAUTH_TOKEN` on the fleet. `./agent-tokens.sh claude`. |
+| An agent is listed but `prompt`/`keys` fail with *not an active named agent* | Something stamped a **reported agent label** on its pane (darwin does this when it takes one over). herdr treats that label as authoritative over its own live detection, and only *detected* agents accept input. `fleet read` still works. |
+| An agent vanishes from `fleet agents` entirely | Its pane lost its `name`. **`herdr pane release-agent` clears the reported stamp and the name with it** — the session keeps running, but an unnamed, undetected pane is invisible to the fleet API, so a live agent looks dead. Re-add it with `herdr agent rename <pane-id> <name>` (positional target first). |
+| A pane darwin spawned has no name at all | darwin calls `pane report-agent` (a label) but not `agent rename` (a name), so its panes are born nameless and unreachable from off the machine. |
 
 Read `README.md` in the repository root for the reasoning behind any of
 this, and `./provision.sh --help` / `fleet --help` for the full option
