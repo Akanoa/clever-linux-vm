@@ -7,6 +7,12 @@
       "skillPath": "skills/clever-tools/SKILL.md",
       "computedHash": "5ea616103aeed90182a4f6f7cbee250663df9676fc05f98d868825e0434c9f5a"
     },
+    "darwin": {
+      "source": "Akanoa/skill-darwin",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "c08114e1ab9ce0c1e05c5c442078482d79c3ff0137b41b946038383ff3bc3099"
+    },
     "find-skills": {
       "source": "vercel-labs/skills",
       "sourceType": "github",

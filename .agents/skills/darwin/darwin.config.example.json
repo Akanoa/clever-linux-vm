@@ -1,0 +1,85 @@
+{
+  "isolation": "auto",
+  "spawn": "auto",
+  "bus": "auto",
+  "max_rounds": 3,
+  "escalate_after_fabrications": 2,
+  "worktree_root": ".darwin/worktrees",
+  "branch_prefix": "darwin",
+  "test": {
+    "command": "npm test --silent",
+    "single_command": "npm test --silent -- -t {selector}",
+    "timeout_sec": 900,
+    "verify_targeted": "auto",
+    "env": {
+      "CI": "1"
+    }
+  },
+  "mutation": {
+    "min_mutants": 5,
+    "reviewer_min_mutants": 3,
+    "require_kill_rate": 1.0,
+    "allow_equivalent": true
+  },
+  "agents": {
+    "implementer": {
+      "provider": "claude",
+      "model": "claude-opus-5",
+      "timeout_sec": 3600,
+      "cmd": null
+    },
+    "reviewer": {
+      "provider": "codex",
+      "model": "gpt-5",
+      "timeout_sec": 3600,
+      "cmd": null
+    }
+  },
+  "guards": {
+    "test_path_patterns": [
+      "*test*",
+      "*spec*",
+      "*Test*",
+      "*Spec*",
+      "*__tests__*"
+    ],
+    "config_patterns": [
+      "pytest.ini",
+      "setup.cfg",
+      "tox.ini",
+      "conftest.py",
+      "pyproject.toml",
+      "jest.config.*",
+      "vitest.config.*",
+      "jest.setup.*",
+      ".mocharc.*",
+      "karma.conf.*",
+      "package.json",
+      "phpunit.xml*",
+      "Cargo.toml",
+      "go.mod",
+      "Makefile",
+      "Rakefile",
+      ".rspec",
+      "build.gradle*",
+      "pom.xml",
+      "*.csproj",
+      ".github/workflows/*"
+    ],
+    "skip_markers": [
+      "@pytest\\.mark\\.skip",
+      "@unittest\\.skip",
+      "\\bpytest\\.skip\\(",
+      "\\b(it|test|describe|context)\\.(skip|todo)\\(",
+      "\\bxit\\(",
+      "\\bxdescribe\\(",
+      "\\bt\\.Skip\\(",
+      "#\\[ignore\\]",
+      "@Ignore\\b",
+      "@Disabled\\b",
+      "\\bassert\\s+True\\b",
+      "\\bexpect\\(true\\)\\.toBe\\(true\\)",
+      "\\bassert\\.ok\\(true\\)"
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+# This repo ships executable shell scripts. A checkout under core.autocrlf=true
+# would give them CRLF line endings and bash would refuse to run them, so pin
+# the working-tree encoding here rather than relying on each clone's config.
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
