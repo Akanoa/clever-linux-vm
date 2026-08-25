@@ -179,15 +179,23 @@ wanted = [
     ("sandbox_mode", 'sandbox_mode = "danger-full-access"'),
     ("approval_policy", 'approval_policy = "never"'),
 ]
-new_lines = [line for key, line in wanted if not re.search(r'(?m)^' + re.escape(key) + r'\s*=', text)]
+
+# Split at the first table header - everything before it is top-level
+# preamble, where a bare key belongs; everything from it on must be left
+# exactly as it is. Check for an existing key ONLY in the preamble: the
+# same key text appearing after a table header is a property of *that*
+# table, not a top-level setting already in place - checking the whole
+# file would wrongly treat a stray nested line as "already seeded" and
+# skip adding the real one. (Found live: a manually-appended test line
+# had been snapshotted, restored under the wrong table on a later boot,
+# and made this exact mistake before this fix.)
+m = re.search(r'(?m)^\[', text)
+cut = m.start() if m else len(text)
+preamble, rest = text[:cut], text[cut:]
+new_lines = [line for key, line in wanted
+             if not re.search(r'(?m)^' + re.escape(key) + r'\s*=', preamble)]
 
 if new_lines:
-    # Split at the first table header - everything before it is top-level
-    # preamble, where a bare key belongs; everything from it on must be
-    # left exactly as it is.
-    m = re.search(r'(?m)^\[', text)
-    cut = m.start() if m else len(text)
-    preamble, rest = text[:cut], text[cut:]
     if preamble and not preamble.endswith("\n"):
         preamble += "\n"
     preamble += "\n".join(new_lines) + "\n"
