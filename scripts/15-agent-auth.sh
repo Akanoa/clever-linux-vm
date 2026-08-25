@@ -145,6 +145,47 @@ claude_auth() {
   claude auth status 2>&1 | sed 's/^/[claude] /' | head -5 || true
 }
 
+# codex's own folder-trust prompt - the same gate Claude's onboarding
+# seeding above answers, just a different agent asking it. Unattended, it
+# wedges the pane forever: found live, on a fresh box, via herdr - a
+# `codex` pane sat at "Do you trust the contents of this directory?"
+# with no agent identity yet for `herdr agent send-keys` to reach, so
+# there was no way to answer it after the fact.
+seed_codex_trust() {
+  have codex || return 0
+  mkdir -p "$HOME/.codex"
+  CODEX_CONFIG="$HOME/.codex/config.toml" CODEX_TRUST_DIRS="$HOME/workspace:$APP_HOME" python3 - <<'PYEOF'
+import os
+
+path = os.environ["CODEX_CONFIG"]
+try:
+    with open(path) as fh:
+        text = fh.read()
+except OSError:
+    text = ""
+
+added = []
+for raw in os.environ.get("CODEX_TRUST_DIRS", "").split(":"):
+    d = os.path.realpath(raw) if raw else ""
+    if not d or not os.path.isdir(d):
+        continue
+    header = '[projects."{}"]'.format(d)
+    if header in text:
+        continue  # already seeded, or a deliberate manual setting - leave it
+    text += "\n{}\ntrust_level = \"trusted\"\n".format(header)
+    added.append(d)
+
+if added:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+    print("codex: trusted " + ", ".join(added))
+else:
+    print("codex: folder trust already seeded")
+PYEOF
+}
+
 codex_auth() {
   have codex || return 0
   if codex login status >/dev/null 2>&1; then
@@ -180,6 +221,7 @@ opencode_auth() {
 
 seed_claude_onboarding 2>&1 | sed 's/^/[vm-agent] /' || true
 seed_claude_permissions 2>&1 | sed 's/^/[vm-agent] /' || true
+seed_codex_trust 2>&1 | sed 's/^/[vm-agent] /' || true
 claude_auth   || true
 codex_auth    || true
 opencode_auth || true
