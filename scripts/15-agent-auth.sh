@@ -145,6 +145,62 @@ claude_auth() {
   claude auth status 2>&1 | sed 's/^/[claude] /' | head -5 || true
 }
 
+# codex's sandbox needs bubblewrap for real isolation, which does not
+# exist on this no-root, no-package-manager runtime - codex falls back to
+# a bundled copy, but the fallback is unnecessary work for a threat model
+# this fleet already resolved differently: the VM itself is the isolation
+# boundary (a disposable, single-purpose container), and
+# CLAUDE_PERMISSION_MODE=bypassPermissions already means "no per-command
+# gates" for Claude. danger-full-access + never is the same posture for
+# codex, and it skips constructing a sandbox at all, which is what
+# actually removes the bubblewrap warning - installing bubblewrap would
+# not, since there is nowhere to install it to.
+#
+# Must land before any [projects."<dir>"] table seed_codex_trust below
+# writes: TOML has no "back to top-level" marker, so a bare key placed
+# after a table header would silently become a property of that table
+# instead of a top-level setting. Insert into the preamble, not the end.
+seed_codex_permissions() {
+  local mode="${CLAUDE_PERMISSION_MODE:-acceptEdits}"
+  [ "$mode" = "bypassPermissions" ] || return 0
+  have codex || return 0
+  mkdir -p "$HOME/.codex"
+  CODEX_CONFIG="$HOME/.codex/config.toml" python3 - <<'PYEOF'
+import os, re
+
+path = os.environ["CODEX_CONFIG"]
+try:
+    with open(path) as fh:
+        text = fh.read()
+except OSError:
+    text = ""
+
+wanted = [
+    ("sandbox_mode", 'sandbox_mode = "danger-full-access"'),
+    ("approval_policy", 'approval_policy = "never"'),
+]
+new_lines = [line for key, line in wanted if not re.search(r'(?m)^' + re.escape(key) + r'\s*=', text)]
+
+if new_lines:
+    # Split at the first table header - everything before it is top-level
+    # preamble, where a bare key belongs; everything from it on must be
+    # left exactly as it is.
+    m = re.search(r'(?m)^\[', text)
+    cut = m.start() if m else len(text)
+    preamble, rest = text[:cut], text[cut:]
+    if preamble and not preamble.endswith("\n"):
+        preamble += "\n"
+    preamble += "\n".join(new_lines) + "\n"
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(preamble + rest)
+    os.replace(tmp, path)
+    print("codex: unattended mode (danger-full-access, never) - " + ", ".join(k for k, _ in wanted))
+else:
+    print("codex: unattended mode already seeded")
+PYEOF
+}
+
 # codex's own folder-trust prompt - the same gate Claude's onboarding
 # seeding above answers, just a different agent asking it. Unattended, it
 # wedges the pane forever: found live, on a fresh box, via herdr - a
@@ -221,6 +277,7 @@ opencode_auth() {
 
 seed_claude_onboarding 2>&1 | sed 's/^/[vm-agent] /' || true
 seed_claude_permissions 2>&1 | sed 's/^/[vm-agent] /' || true
+seed_codex_permissions 2>&1 | sed 's/^/[vm-agent] /' || true
 seed_codex_trust 2>&1 | sed 's/^/[vm-agent] /' || true
 claude_auth   || true
 codex_auth    || true
