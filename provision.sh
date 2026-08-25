@@ -39,6 +39,12 @@
 #             Bucket and the Configuration provider. They outlive the VMs
 #             otherwise, and so does everything the agents stored on them.
 #   --force   deploy even while agents are working (kills their panes)
+#   --no-roster  do not republish VM_AGENT_FLEET. Adding a VM normally
+#             rewrites the roster in the shared config, which restarts
+#             every linked app and kills the panes of agents that are
+#             mid-task. With this flag the new VM is created and deployed
+#             while the rest of the fleet keeps running, unaware of it;
+#             re-run without the flag once the fleet is quiet to publish.
 set -uo pipefail
 
 # ---------------------------------------------------------------- config
@@ -74,6 +80,7 @@ CELLAR_BUCKET_NAME="${CELLAR_BUCKET_NAME:-}"
 FS_ADDON="${FS_ADDON:-vm-agent-fs}"
 FORGET=()
 FORCE=false
+NO_ROSTER=false
 DESTROY_ALL=false
 PURGE=false
 # Empty means the personal space - which is exactly what clever does when
@@ -269,6 +276,9 @@ mint_token() {
 # - which destroys every herdr pane and kills whatever the agents were in
 # the middle of. Nothing warned about that, and it has silently thrown away
 # work more than once, so check before doing it.
+# Any VM named in $@ is checked; with no arguments the whole roster is.
+# --no-roster restarts only the boxes it deploys, so it narrows the check
+# instead of holding the run hostage to an agent on an untouched VM.
 busy_agents() {
   local env_file="$SECRETS_DIR/fleet.env" roster token vm url busy out
   [ -f "$env_file" ] || return 0
@@ -279,6 +289,7 @@ busy_agents() {
   busy=""
   for entry in $(printf '%s' "$roster" | tr ',' ' '); do
     vm="${entry%%=*}"; url="${entry#*=}"
+    if [ "$#" -gt 0 ] && ! printf '%s\n' "$@" | grep -qxF "$vm"; then continue; fi
     out="$(curl -sS --max-time 10 "$url/agents" -H "Authorization: Bearer $token" 2>/dev/null)" || continue
     printf '%s' "$out" | json_has '.result.agents' || continue
     while read -r a; do
@@ -289,8 +300,14 @@ busy_agents() {
   done
   [ -z "$busy" ] && return 0
   printf '%s\n' "$c_err  ! agents are mid-task: $busy$c_off" >&2
-  printf '%s\n' "$c_err    deploying restarts every VM and destroys their panes.$c_off" >&2
-  printf '%s\n' "$c_err    wait, or re-run with --force to kill them anyway.$c_off" >&2
+  if $NO_ROSTER; then
+    printf '%s\n' "$c_err    deploying these VMs destroys their panes.$c_off" >&2
+    printf '%s\n' "$c_err    wait, or re-run with --force to kill them anyway.$c_off" >&2
+  else
+    printf '%s\n' "$c_err    publishing the roster restarts every VM and destroys their panes.$c_off" >&2
+    printf '%s\n' "$c_err    wait, add --no-roster to leave the rest of the fleet alone,$c_off" >&2
+    printf '%s\n' "$c_err    or re-run with --force to kill them anyway.$c_off" >&2
+  fi
   return 1
 }
 
@@ -346,7 +363,17 @@ sync_shared_config() {
   add_var GIT_USER_EMAIL   "$GIT_EMAIL"
   add_var GIT_SIGN_COMMITS "$SIGN_COMMITS"
   add_var CELLAR_BUCKET    "$CELLAR_BUCKET_NAME"
-  add_var VM_AGENT_FLEET   "$FLEET_ROSTER"
+  # --no-roster keeps whatever the provider already publishes, so the write
+  # below comes out identical and no linked app is restarted. A fleet with
+  # nothing published yet still gets a roster - there is no pane to save.
+  local roster="$FLEET_ROSTER"
+  if $NO_ROSTER; then
+    local published
+    published="$(printf '%s' "$current" \
+      | jq -r '.[]? | select(.name=="VM_AGENT_FLEET") | .value' | head -1)"
+    [ -n "$published" ] && roster="$published"
+  fi
+  add_var VM_AGENT_FLEET   "$roster"
   add_var CLAUDE_PERMISSION_MODE "$CLAUDE_PERMISSION_MODE_VALUE"
 
   for var in "${SHARED_SECRETS[@]}"; do
@@ -671,6 +698,7 @@ while [ $# -gt 0 ]; do
                 esac ;;
     --yes|-y)   CONFIRMED=true; shift ;;
     --force)    FORCE=true; shift ;;
+    --no-roster) NO_ROSTER=true; shift ;;
     --purge)    PURGE=true; shift ;;
     -h|--help)  usage ;;
     -*)         die "unknown option: $1" ;;
@@ -742,7 +770,28 @@ case "$ACTION" in
     [ "$ACTION" = all ] && { [ -s "$FLEET_FILE" ] || die "vms.txt is empty - provision a VM first"; }
     [ "$ACTION" = provision ] && [ "${#NAMES[@]}" -eq 0 ] && usage 1
 
-    if ! $FORCE; then busy_agents || die "aborted to protect running agents"; fi
+    # The VMs this run will deploy, expanded once so the busy check and the
+    # provisioning loop cannot disagree about who is being touched.
+    TARGETS=()
+    if [ "$ACTION" = all ]; then
+      while read -r n; do [ -n "$n" ] && TARGETS+=("$n"); done < "$FLEET_FILE"
+    else
+      for base in "${NAMES[@]}"; do
+        if [ "$COUNT" -gt 1 ]; then
+          for i in $(seq 1 "$COUNT"); do TARGETS+=("$base-$i"); done
+        else
+          TARGETS+=("$base")
+        fi
+      done
+    fi
+
+    if ! $FORCE; then
+      if $NO_ROSTER; then
+        busy_agents ${TARGETS[@]+"${TARGETS[@]}"} || die "aborted to protect running agents"
+      else
+        busy_agents || die "aborted to protect running agents"
+      fi
+    fi
 
     hdr "shared resources"
     $PER_VM_KEY || ensure_key "$KEY_PATH"
@@ -769,17 +818,7 @@ case "$ACTION" in
     sync_shared_config "$CONFIG_ID"
     write_local_fleet_env
 
-    if [ "$ACTION" = all ]; then
-      while read -r n; do [ -n "$n" ] && provision_one "$n" "$CONFIG_ID"; done < "$FLEET_FILE"
-    else
-      for base in "${NAMES[@]}"; do
-        if [ "$COUNT" -gt 1 ]; then
-          for i in $(seq 1 "$COUNT"); do provision_one "$base-$i" "$CONFIG_ID"; done
-        else
-          provision_one "$base" "$CONFIG_ID"
-        fi
-      done
-    fi
+    for n in ${TARGETS[@]+"${TARGETS[@]}"}; do provision_one "$n" "$CONFIG_ID"; done
 
     # A brand-new VM has no app id until it has been created, so the roster
     # built before the loop cannot name it. Republish now that every app
@@ -789,6 +828,24 @@ case "$ACTION" in
     FLEET_ROSTER="$(build_fleet_roster)"
     sync_shared_config "$CONFIG_ID"
     write_local_fleet_env
+
+    # Held back on purpose - say so, and name what the fleet cannot see, or
+    # the next person wonders why a VM that exists is unreachable from it.
+    if $NO_ROSTER; then
+      published="$(cp_read "$CONFIG_ID" \
+        | jq -r '.[]? | select(.name=="VM_AGENT_FLEET") | .value' | head -1)"
+      unseen=""
+      for entry in $(printf '%s' "$FLEET_ROSTER" | tr ',' ' '); do
+        printf '%s' "$published" | tr ',' '\n' | grep -qxF "$entry" \
+          || unseen="${unseen:+$unseen }${entry%%=*}"
+      done
+      if [ -n "$unseen" ]; then
+        say "roster not published (--no-roster): the fleet cannot see $unseen"
+        say "re-run without --no-roster once the fleet is quiet to publish it"
+      else
+        skip "roster held back (--no-roster), but nothing was missing from it"
+      fi
+    fi
     ;;
 esac
 

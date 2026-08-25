@@ -138,7 +138,7 @@ variable of the same name overrides it, so a one-off
 
 Options: `--flavor`, `--region`, `--config <addon-name>`,
 `--cellar <addon-name>`, `--key <path>`, `--per-vm-key`, `--no-deploy`,
-`--forget <VAR>`.
+`--no-roster`, `--forget <VAR>`.
 
 Tokens come from `.secrets/tokens.env` (gitignored) or the surrounding
 environment. **An empty local token never blanks one already in the
@@ -149,6 +149,14 @@ in your shell is safe.
 whatever agents were mid-task — a write to the shared config does the same,
 since Clever Cloud restarts linked apps on change. `provision.sh` refuses
 when any agent is `working` or `blocked`; `--force` overrides.
+
+Adding a VM is a shared-config write, because `VM_AGENT_FLEET` gains a
+member — so creating one box restarts every other one. `--no-roster` keeps
+the published roster as it is: the new VM is created and deployed, the rest
+of the fleet keeps working and simply does not know about it yet, and the
+busy check narrows to the VMs actually being deployed. Re-run without the
+flag once the fleet is quiet to publish the roster (that run restarts
+everything).
 
 `--destroy` removes an app and its own two add-ons, never the shared
 provider.

@@ -178,6 +178,7 @@ again.
 | VM reachable, agent never answers | It is blocked on a prompt. `fleet read` to see it, `fleet keys` to answer. |
 | `fleet fetch` 404s | The agent has not written `~/out/<name>.md` yet, or ignored the instruction. Check with `fleet read`. |
 | Deploy refuses | An agent is mid-task. `--force` overrides and kills its pane. |
+| Adding a VM refuses because agents on *other* VMs are busy | The new name changes `VM_AGENT_FLEET`, and publishing it restarts every linked app. `--no-roster` creates and deploys the new VM without republishing, leaving the busy ones alone; re-run without it later to publish. |
 | Agent has no model access | No `CLAUDE_CODE_OAUTH_TOKEN` on the fleet. `./agent-tokens.sh claude`. |
 | An agent is listed but `prompt`/`keys` fail with *not an active named agent* | Something stamped a **reported agent label** on its pane (darwin does this when it takes one over). herdr treats that label as authoritative over its own live detection, and only *detected* agents accept input. `fleet read` still works. |
 | An agent vanishes from `fleet agents` entirely | Its pane lost its `name`. **`herdr pane release-agent` clears the reported stamp and the name with it** — the session keeps running, but an unnamed, undetected pane is invisible to the fleet API, so a live agent looks dead. Re-add it with `herdr agent rename <pane-id> <name>` (positional target first). |
