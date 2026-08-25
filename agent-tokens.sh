@@ -8,6 +8,7 @@
 #
 #   ./agent-tokens.sh                 show what is set (masked)
 #   ./agent-tokens.sh claude          run `claude setup-token` and store it
+#   ./agent-tokens.sh codex           run `codex login` (ChatGPT) and store it
 #   ./agent-tokens.sh set  <VAR>      prompt for a value without echoing it
 #   ./agent-tokens.sh unset <VAR>     remove it
 set -uo pipefail
@@ -25,7 +26,8 @@ TOKENS="$SECRETS_DIR/tokens.env"
 KNOWN=(
   "CLAUDE_CODE_OAUTH_TOKEN:Claude Code, long-lived subscription token"
   "ANTHROPIC_API_KEY:Anthropic API key (claude + opencode)"
-  "OPENAI_API_KEY:OpenAI API key (codex + opencode)"
+  "CODEX_AUTH_JSON_B64:codex, ChatGPT subscription login (preferred over the key below)"
+  "OPENAI_API_KEY:OpenAI API key, pay-as-you-go (codex fallback + opencode)"
   "OPENROUTER_API_KEY:OpenRouter key (opencode)"
   "GH_TOKEN:GitHub CLI and HTTPS pushes"
   "GITLAB_TOKEN:GitLab CLI"
@@ -122,10 +124,46 @@ MSG
   ok "CLAUDE_CODE_OAUTH_TOKEN stored: $(mask "$value")"
 }
 
+do_codex() {
+  # A ChatGPT sign-in doesn't hand back a pasteable token the way Claude's
+  # subscription flow does - it writes straight to a file. So the whole
+  # file is what gets shared with the fleet, base64'd the same way the
+  # commit key is; scripts/15-agent-auth.sh decodes it back on each VM.
+  local target="${1:-$HOME/.codex/auth.json}"
+
+  if [ -f "$target" ]; then
+    ok "found $target - using it as-is"
+  else
+    command -v codex >/dev/null 2>&1 \
+      || die "codex is not installed locally, and $target does not exist - install codex and run 'codex login', or pass the path to an existing auth.json: ./agent-tokens.sh codex <path>"
+
+    cat <<'MSG'
+
+  `codex login` opens a browser for a ChatGPT sign-in - subscription
+  billing (Plus/Pro/Team), not the pay-as-you-go API key. One login serves
+  the whole fleet, the same way the Claude subscription token does.
+
+MSG
+    printf '  run it now? [Y/n] '; read -r reply
+    case "${reply:-y}" in
+      [nN]*) die "skipped - re-run once $target exists, or pass its path directly" ;;
+      *)     codex login || die "codex login did not complete - $target was not written" ;;
+    esac
+    [ -f "$target" ] || die "codex login finished but $target was not found"
+  fi
+
+  local value
+  value="$(base64 -w0 < "$target")"
+  [ -n "$value" ] || die "$target is empty - nothing stored"
+  put CODEX_AUTH_JSON_B64 "$value"
+  ok "CODEX_AUTH_JSON_B64 stored from $target ($(wc -c < "$target") bytes)"
+}
+
 init_store
 case "${1:-show}" in
   show|"")  do_show ;;
   claude)   do_claude; do_show ;;
+  codex)    do_codex "${2:-}"; do_show ;;
   set)      [ $# -ge 2 ] || die "usage: ./agent-tokens.sh set <VAR>"; do_set "$2"; do_show ;;
   unset)    [ $# -ge 2 ] || die "usage: ./agent-tokens.sh unset <VAR>"
             is_known "$2" || die "unknown variable: $2"
