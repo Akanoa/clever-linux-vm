@@ -110,8 +110,7 @@ provider** add-on, `vm-agent-config`, linked to every app:
 | `GH_TOKEN`, `GITLAB_TOKEN`, `GITLAB_HOST` | `CELLAR_BUCKET` |
 | `GIT_USER_NAME`, `GIT_USER_EMAIL`, `GIT_SIGN_COMMITS` | `VM_AGENT_NAME` |
 | `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` | |
-| `CODEX_AUTH_JSON_B64`, `OPENAI_API_KEY` | |
-| `OPENROUTER_API_KEY` | |
+| `OPENAI_API_KEY`, `OPENROUTER_API_KEY` | |
 
 So a token is rotated in one place and every box picks it up — Clever Cloud
 restarts the linked applications automatically. Values set directly on an
@@ -169,7 +168,6 @@ is the way to change one afterwards.
 ```bash
 ./agent-tokens.sh                      # what is set, masked
 ./agent-tokens.sh claude               # run `claude setup-token`, store the result
-./agent-tokens.sh codex                # run `codex login` (ChatGPT), store the result
 ./agent-tokens.sh set OPENAI_API_KEY   # hidden prompt for any supported key
 ./provision.sh --all --no-deploy       # apply to the fleet
 ```
@@ -195,27 +193,32 @@ How each agent picks its credentials up:
 |---|---|
 | `claude` | reads `CLAUDE_CODE_OAUTH_TOKEN`, else `ANTHROPIC_API_KEY`, else the restored session |
 | `opencode` | reads `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `OPENROUTER_API_KEY` |
-| `codex` | keeps credentials in a file: `CODEX_AUTH_JSON_B64` (ChatGPT subscription) wins over `codex login --with-api-key` from `OPENAI_API_KEY` (pay-as-you-go) when both are set |
+| `codex` | keeps credentials in a file, so boot runs `codex login --with-api-key` when `OPENAI_API_KEY` is set |
 
 `claude setup-token` needs a Claude subscription and issues one long-lived
 token that serves the whole fleet — unlike copying `~/.claude/.credentials.json`,
 which would make every VM refresh the same OAuth session and invalidate
 each other.
 
-`codex` has no equivalent "issue a fleet-wide token" command — `codex login`
-is a ChatGPT sign-in that writes straight to `~/.codex/auth.json` on
-whichever machine ran it, so `./agent-tokens.sh codex` runs it locally (or
-reuses an existing `~/.codex/auth.json` if you're already signed in) and
-shares the *file*, base64'd into `CODEX_AUTH_JSON_B64`, the same way the
-commit key is shared. Treat it like a password: it's a live OAuth session,
-not a revocable API key.
+`codex` has no equivalent: a ChatGPT-subscription login (`codex login`)
+writes an OAuth refresh token to `~/.codex/auth.json`, and that token
+rotates on every use. Copying the file to share it fleet-wide — the same
+trick that works for the commit key — does not work here: whichever
+machine uses it first rotates the token, and the copy everywhere else
+dies with *"refresh token was already used"* on its next real request.
+(Confirmed against a live VM, not theoretical — the first attempt at this
+failed exactly that way.) There is no shareable ChatGPT credential for
+codex; run `codex login --device-auth` on each VM that needs one — the
+device code lets you complete the browser step from any machine, so the
+VM itself never needs one — and it persists like any other interactive
+login, below.
 
 Interactive `claude auth login`, `codex login` and `opencode auth login`
 inside a box still work, and the state snapshot carries them across
 restarts. `/status` reports what each agent found:
 
 ```json
-"agent_auth": { "claude": "subscription-token", "codex": null, "opencode": ["anthropic"] }
+"agent_auth": { "claude": "subscription-token", "codex": "logged-in", "opencode": ["anthropic"] }
 ```
 
 ## Demo

@@ -7,11 +7,16 @@
 #
 #   claude   reads CLAUDE_CODE_OAUTH_TOKEN (or ANTHROPIC_API_KEY) directly
 #   opencode reads ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY
-#   codex    keeps credentials in a file, so it gets an explicit login -
-#            CODEX_AUTH_JSON_B64 (a ChatGPT subscription login, captured
-#            once with ./agent-tokens.sh codex) wins over OPENAI_API_KEY
-#            (pay-as-you-go), since the former is what you actually want
-#            for sustained coding use
+#   codex    keeps credentials in a file, so it gets an explicit login
+#
+# ChatGPT-subscription login for codex cannot be a shared secret the way
+# CLAUDE_CODE_OAUTH_TOKEN is: codex's OAuth refresh token rotates on every
+# use, so a copy handed to a second machine (or reused after the source
+# session has refreshed even once) dies with "refresh token was already
+# used" on its very first real request - confirmed against a live VM, not
+# theoretical. Run `codex login --device-auth` once per VM instead - it is
+# already snapshotted by 00-persist.sh, so that session survives restarts
+# exactly like an interactive `claude auth login` does for Claude.
 #
 # An interactive `claude auth login` / `codex login` inside a box still
 # works and survives restarts through the state snapshot; this script only
@@ -146,22 +151,6 @@ codex_auth() {
     log "codex: already logged in"
     return 0
   fi
-  # ChatGPT subscription billing over the pay-as-you-go key, when both are
-  # set - it is the one actually meant for sustained coding use. This is a
-  # whole file, not a bearer string, so it is decoded straight to where
-  # codex expects it rather than passed through a login subcommand.
-  if [ -n "${CODEX_AUTH_JSON_B64:-}" ]; then
-    mkdir -p "$HOME/.codex"
-    if printf '%s' "$CODEX_AUTH_JSON_B64" | base64 -d > "$HOME/.codex/auth.json" 2>/dev/null; then
-      chmod 600 "$HOME/.codex/auth.json"
-      if codex login status >/dev/null 2>&1; then
-        log "codex: logged in with the ChatGPT subscription (CODEX_AUTH_JSON_B64)"
-        return 0
-      fi
-    fi
-    log "codex: CODEX_AUTH_JSON_B64 was set but did not produce a valid login"
-    rm -f "$HOME/.codex/auth.json"
-  fi
   if [ -n "${OPENAI_API_KEY:-}" ]; then
     if printf '%s' "$OPENAI_API_KEY" | codex login --with-api-key >/dev/null 2>&1; then
       log "codex: logged in with OPENAI_API_KEY $(mask "$OPENAI_API_KEY")"
@@ -169,8 +158,8 @@ codex_auth() {
       log "codex: OPENAI_API_KEY was rejected"
     fi
   else
-    log "codex: no credentials - run 'codex login' inside the box, or set" \
-        "CODEX_AUTH_JSON_B64 (ChatGPT subscription) / OPENAI_API_KEY (pay-as-you-go)"
+    log "codex: no credentials - run 'codex login --device-auth' inside the box" \
+        "for a ChatGPT subscription, or set OPENAI_API_KEY for pay-as-you-go"
   fi
 }
 

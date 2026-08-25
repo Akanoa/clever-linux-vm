@@ -156,9 +156,7 @@ def agent_auth():
     else:
         claude = None
 
-    if os.environ.get("CODEX_AUTH_JSON_B64"):
-        codex = "subscription-login"
-    elif os.path.exists(os.path.join(HOME, ".codex/auth.json")):
+    if os.path.exists(os.path.join(HOME, ".codex/auth.json")):
         codex = "logged-in"
     elif os.environ.get("OPENAI_API_KEY"):
         codex = "api-key"
