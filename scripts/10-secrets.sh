@@ -102,6 +102,29 @@ configure_glab() {
   glab auth status 2>&1 | sed 's/^/[glab] /' || log "glab auth check failed"
 }
 
+# git over HTTPS to the GitLab host, the way `gh auth setup-git` does it for
+# GitHub: a helper that reads `$GITLAB_TOKEN` at call time.
+#
+# Deliberately **not** a credential file. Two things go wrong with one, and both
+# have: a copy written by hand is a second place the token has to be rotated, and
+# it goes stale silently — a wrong value there fails exactly like a revoked token.
+# And `$HOME` is local disk, rebuilt on every boot, so `~/.git-credentials`
+# disappears on the next restart while `~/workspace` (the bucket) keeps a copy
+# git never looks at. Reading the environment has neither problem: there is one
+# value, the current one, and a rotation lands with the restart that publishes it.
+#
+# Registered per-host so it cannot answer for github.com, which `gh` owns.
+configure_git_https() {
+  local host="${GITLAB_HOST:-gitlab.com}"
+  if [ -z "${GITLAB_TOKEN:-}" ]; then
+    log "GITLAB_TOKEN empty - git over HTTPS to $host left unauthenticated"
+    return 0
+  fi
+  git config --global --replace-all "credential.https://$host.helper" \
+    '!f() { echo username=oauth2; echo "password=${GITLAB_TOKEN}"; }; f'
+  log "git https credential helper installed for $host"
+}
+
 configure_cellar() {
   if [ -z "${CELLAR_ADDON_KEY_ID:-}" ]; then
     log "no Cellar credentials in the environment - skipping s3cmd config"
@@ -147,4 +170,5 @@ install_ssh_key || true
 configure_git   || true
 configure_gh    || true
 configure_glab  || true
+configure_git_https || true
 configure_cellar || true
