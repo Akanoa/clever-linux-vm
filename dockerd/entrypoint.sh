@@ -15,7 +15,17 @@ cat > /usr/local/bin/health-response <<'RESPONSE'
 printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nConnection: close\r\n\r\nvm-agent dockerd\n'
 RESPONSE
 chmod +x /usr/local/bin/health-response
-socat TCP-LISTEN:8080,fork,reuseaddr SYSTEM:/usr/local/bin/health-response &
+# The platform probes 8080 once a minute and closes as soon as it has the
+# response, while socat still has the socket open for reading - so every
+# single probe ends in "Connection reset by peer" (or "Broken pipe", when
+# the close lands mid-write). Measured in the container: three probes,
+# three errors, and draining the request first changes nothing, because
+# the reset comes from the prober's close, not from the unread request.
+# It is pure noise - one line a minute, for ever - so filter exactly those
+# two and keep every other socat error, which is how a genuine failure
+# (a port already bound, say) still reaches the log.
+socat TCP-LISTEN:8080,fork,reuseaddr SYSTEM:/usr/local/bin/health-response \
+  2> >(grep -vE 'Connection reset by peer|Broken pipe' >&2) &
 HEALTH_PID=$!
 log "health endpoint on 0.0.0.0:8080 (pid $HEALTH_PID)"
 
