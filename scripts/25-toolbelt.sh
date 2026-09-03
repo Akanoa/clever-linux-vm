@@ -46,6 +46,18 @@ one:
   ships the bytes over the API.
 - **`Testcontainers.exposeHostPorts()`** - the reverse direction, a
   container reaching a server running here. The tunnel is one-way.
+- **Containers that advertise their own address.** You reach the published
+  port fine, then the service answers with `172.17.0.3` - its address on the
+  companion's bridge, unroutable from here - and your test *hangs* rather
+  than failing. FoundationDB does this; `FDB_NETWORKING_MODE=host` makes it
+  advertise loopback, which matches the forward. Postgres, Redis and friends
+  are fine.
+
+Bulk transfer through the API is slow: `docker cp` of 24 MB takes ~2 minutes,
+`docker export` of an image filesystem is unusable. Image pulls are fine -
+they happen daemon-side. And under heavy parallelism a Docker API read can
+stall for ever (~0.6% of container cycles at `-j 6`), so keep test
+concurrency moderate and set a per-test timeout so a stall fails loudly.
 
 If a container starts and the test cannot reach it, check `./tunnel.sh
 status` first: the forward is added when the container starts, so a dead

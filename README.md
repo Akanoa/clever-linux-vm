@@ -416,6 +416,24 @@ ships the bytes over the API. **`Testcontainers.exposeHostPorts()`** — a
 container reaching a server on the VM — is the reverse direction and is not
 forwarded.
 
+The subtler one, found the hard way against `clever-kms`: **a container whose
+protocol hands the client a second address of its own**. Reaching it over its
+published port works, and then the service answers with `172.17.0.3` — its
+address on the *companion's* bridge, which nothing here can route to. The test
+does not fail, it hangs, silently and for ever. FoundationDB does exactly this;
+the cure is to make the container advertise loopback (`FDB_NETWORKING_MODE=host`
+for that image), which lines up with the tunnel because the forwarded port keeps
+its number. Anything speaking purely over its published port — Postgres, Redis,
+Kafka with the right advertised listener — is unaffected.
+
+Two more measured limits. **Bulk transfer through the API is slow**: `docker cp`
+of a 24 MB file takes ~2 minutes and `docker export` of a whole image filesystem
+is unusable — image pulls are fine, they happen daemon-side. And **the tunnel is
+not perfectly reliable under load**: at `-j 6`, 3 of 470 container cycles (~0.6%)
+stalled on a Docker API read that never returned. Testcontainers sets no timeout
+there, so a stall wedges the run instead of failing it — keep concurrency
+moderate, and set a `slow-timeout`/terminate-after so it fails loudly.
+
 One companion per VM, not one per fleet: a shared daemon would let one agent
 list, reach and reap another agent's containers. The endpoint, the client key
 and the pinned host key live in the VM's *own* environment rather than the
