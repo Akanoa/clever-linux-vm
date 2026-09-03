@@ -33,6 +33,11 @@ unset d
 export EDITOR="${EDITOR:-vim}"
 export PERSIST_ROOT="${APP_HOME:-$HOME}/persistent"
 
+# The borrowed Docker daemon, if this VM has one. Written by tunnel.sh
+# when the tunnel is actually up, so a shell opened while it is down does
+# not get a DOCKER_HOST pointing at a socket that is not there.
+[ -f /tmp/vm-agent-dockerd.env ] && . /tmp/vm-agent-dockerd.env
+
 alias vm-status='curl -s localhost:8080/status | jq .'
 alias vm-log='tail -n 100 -f /tmp/vm-agent-boot.log'
 

@@ -19,6 +19,7 @@
 #   ./provision.sh --destroy --all --yes     tear the whole fleet down
 #   ./provision.sh --destroy --all --purge --yes   ... and the shared add-ons
 #   ./provision.sh --all --forget OPENAI_API_KEY   drop a shared secret
+#   ./provision.sh --dockerd owl                   give owl a Docker daemon
 #
 # Options
 #   --flavor <size>   pico nano XS S M L XL 2XL 3XL - the VM size. Applies
@@ -29,6 +30,18 @@
 #   --region <zone>   par, grahq, mtl, sgp, syd, wsw (default par)
 #   --org <id|name>   deploy into an organisation instead of your personal
 #                     space; persisted in fleet.conf, so it is asked once
+#   --dockerd         give each VM this run touches a companion Docker
+#                     daemon: a second app on the *docker* runtime with the
+#                     instance's socket mounted, reached over an ssh tunnel
+#                     (tunnel.sh). This is what makes Testcontainers work -
+#                     the linux runtime cannot run a container itself.
+#                     Repeat the flag on later runs to keep it; without it
+#                     an existing companion is left alone, not destroyed.
+#   --dockerd-flavor <size>  size the companion (default M) - it runs the
+#                     test containers, so it wants the room, not the VM.
+#   --dockerd-only    build or repair the companions only, leaving the VMs
+#                     alone. Their code is not redeployed; a VM that exists
+#                     still has its endpoint refreshed, which restarts it.
 #   --no-deploy       apply configuration, but do not push code
 #   --key <path>      commit key to use (default .secrets/id_ed25519)
 #   --per-vm-key      give each VM its own commit key instead of sharing one
@@ -78,6 +91,12 @@ CELLAR_ADDON="${CELLAR_ADDON:-vm-agent-cellar}"
 # Empty means "derive from the add-on id" - see below.
 CELLAR_BUCKET_NAME="${CELLAR_BUCKET_NAME:-}"
 FS_ADDON="${FS_ADDON:-vm-agent-fs}"
+DOCKERD=false
+DOCKERD_ONLY=false
+DOCKERD_FLAVOR="${DOCKERD_FLAVOR:-M}"
+DOCKERD_KEY="$SECRETS_DIR/dockerd/id_ed25519"
+DOCKERD_HOST_KEY="$SECRETS_DIR/dockerd/hostkey_ed25519"
+DOCKERD_ENDPOINT=""
 FORGET=()
 FORCE=false
 NO_ROSTER=false
@@ -276,37 +295,54 @@ mint_token() {
 # - which destroys every herdr pane and kills whatever the agents were in
 # the middle of. Nothing warned about that, and it has silently thrown away
 # work more than once, so check before doing it.
-# Any VM named in $@ is checked; with no arguments the whole roster is.
-# --no-roster restarts only the boxes it deploys, so it narrows the check
-# instead of holding the run hostage to an agent on an untouched VM.
+# $@ is the set of VMs this run targets; every other VM on the roster is a
+# bystander, restarted only because a shared value changed. The two are
+# reported apart, because the way out differs: a bystander can be spared by
+# not republishing the roster, a target cannot be spared at all. Offering
+# --no-roster for a busy target would be advice that cannot work.
 busy_agents() {
-  local env_file="$SECRETS_DIR/fleet.env" roster token vm url busy out
+  local env_file="$SECRETS_DIR/fleet.env" roster token vm url out
+  local busy_targets="" busy_bystanders="" is_target
   [ -f "$env_file" ] || return 0
   roster="$(sed -n 's/^export VM_AGENT_FLEET="\(.*\)"$/\1/p' "$env_file" | tail -1)"
   token="$(sed -n 's/^export VM_AGENT_FLEET_TOKEN="\(.*\)"$/\1/p' "$env_file" | tail -1)"
   [ -n "$roster" ] && [ -n "$token" ] || return 0
 
-  busy=""
   for entry in $(printf '%s' "$roster" | tr ',' ' '); do
     vm="${entry%%=*}"; url="${entry#*=}"
-    if [ "$#" -gt 0 ] && ! printf '%s\n' "$@" | grep -qxF "$vm"; then continue; fi
+    is_target=false
+    printf '%s\n' "$@" | grep -qxF "$vm" && is_target=true
+    # --no-roster leaves bystanders running, so there is nothing to ask
+    # about; --dockerd-only touches no shared value at all, so it cannot
+    # restart a VM it is not targeting either.
+    $is_target || { ! $NO_ROSTER && ! $DOCKERD_ONLY; } || continue
     out="$(curl -sS --max-time 10 "$url/agents" -H "Authorization: Bearer $token" 2>/dev/null)" || continue
     printf '%s' "$out" | json_has '.result.agents' || continue
     while read -r a; do
-      [ -n "$a" ] && busy="${busy:+$busy }$vm/$a"
+      [ -n "$a" ] || continue
+      if $is_target; then busy_targets="${busy_targets:+$busy_targets }$vm/$a"
+      else busy_bystanders="${busy_bystanders:+$busy_bystanders }$vm/$a"; fi
     done < <(printf '%s' "$out" | jq -r '.result.agents[]?
              | select(.agent_status=="working" or .agent_status=="blocked")
              | .name // .pane_id')
   done
-  [ -z "$busy" ] && return 0
-  printf '%s\n' "$c_err  ! agents are mid-task: $busy$c_off" >&2
-  if $NO_ROSTER; then
-    printf '%s\n' "$c_err    deploying these VMs destroys their panes.$c_off" >&2
+  [ -z "$busy_targets" ] && [ -z "$busy_bystanders" ] && return 0
+
+  [ -n "$busy_targets" ] && printf '%s\n' \
+    "$c_err  ! agents are mid-task on VMs this run targets: $busy_targets$c_off" >&2
+  [ -n "$busy_bystanders" ] && printf '%s\n' \
+    "$c_err  ! agents are mid-task on VMs this run only restarts: $busy_bystanders$c_off" >&2
+
+  if [ -n "$busy_targets" ]; then
+    # Redeploying a VM restarts it whatever else the run does, so no flag
+    # short of --force gets past this one. Do not offer one that cannot help.
+    printf '%s\n' "$c_err    this run targets these VMs directly, so their panes go either way.$c_off" >&2
     printf '%s\n' "$c_err    wait, or re-run with --force to kill them anyway.$c_off" >&2
   else
-    printf '%s\n' "$c_err    publishing the roster restarts every VM and destroys their panes.$c_off" >&2
-    printf '%s\n' "$c_err    wait, add --no-roster to leave the rest of the fleet alone,$c_off" >&2
-    printf '%s\n' "$c_err    or re-run with --force to kill them anyway.$c_off" >&2
+    printf '%s\n' "$c_err    publishing the roster restarts them and destroys their panes.$c_off" >&2
+    printf '%s\n' "$c_err    wait, or --force to kill them anyway. --no-roster spares them$c_off" >&2
+    printf '%s\n' "$c_err    only if the roster is the sole shared value this run changes -$c_off" >&2
+    printf '%s\n' "$c_err    a new or rotated secret restarts the whole fleet regardless.$c_off" >&2
   fi
   return 1
 }
@@ -430,6 +466,176 @@ ensure_key() {
   fi
 }
 
+# --------------------------------------------------------------- deploy
+# Shared by the VMs and by their companion daemons: both are this same
+# repository, pushed to different runtimes.
+deploy_app() {
+  local name="$1" want out got
+  if ! $DEPLOY; then skip "deploy skipped (--no-deploy)"; return; fi
+
+  want="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
+  got="$(clever status --alias "$name" --format json 2>/dev/null | jq -r '.commit // ""')"
+
+  if [ -n "$want" ] && [ "$want" = "$got" ]; then
+    skip "already running $(printf '%.7s' "$want")"
+    return
+  fi
+
+  say "deploying $(printf '%.7s' "$want")"
+  # --force: the Clever remote is a deploy target, not a source of truth,
+  # so a rewritten local history must win. --same-commit-policy restart
+  # makes a no-op deploy pick up changed environment instead of erroring.
+  out="$(clever deploy --alias "$name" --force --same-commit-policy restart 2>&1)"
+
+  # Judge by the commit the platform reports, not by the exit code or by
+  # grepping the log: a rejected push once slipped through both.
+  got="$(clever status --alias "$name" --format json 2>/dev/null | jq -r '.commit // ""')"
+  if [ -n "$want" ] && [ "$want" != "$got" ]; then
+    printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g' | tail -15
+    die "$name is running ${got:-nothing}, expected $want"
+  fi
+  ok "deployed $(printf '%.7s' "$want")"
+}
+
+# -------------------------------------------------- companion Docker daemon
+# A fleet VM cannot run a container and cannot be made to: the linux
+# runtime has an empty subuid map and no cgroup delegation, so rootless
+# podman is out, and there is no daemon to talk to either. The way back to
+# Testcontainers is a second application on the *docker* runtime with
+# CC_MOUNT_DOCKER_SOCKET=true, and an ssh tunnel from the VM to it.
+#
+# The tunnel has to be ours: the platform's own SSH gateway refuses
+# forwarding outright ("administratively prohibited"), so the companion
+# runs its own sshd on 4040, which is where a TCP redirection delivers.
+#
+# One companion per VM rather than one per fleet. They cost nothing here,
+# and a shared daemon would let one agent list, reach and reap another
+# agent's test containers.
+dockerd_name() { printf '%s-dockerd' "$1"; }
+
+ensure_dockerd_keys() {
+  mkdir -p "$SECRETS_DIR/dockerd"; chmod 700 "$SECRETS_DIR"
+  # Its own key pair, not the fleet's commit key: that one is registered on
+  # GitHub and GitLab, and root on a daemon is not something to hand out
+  # with push rights attached.
+  ensure_key "$DOCKERD_KEY"
+  if [ -f "$DOCKERD_HOST_KEY" ]; then
+    skip "dockerd host key present"
+  else
+    ssh-keygen -t ed25519 -C "vm-agent-dockerd-host" -f "$DOCKERD_HOST_KEY" -N "" -q
+    ok "generated dockerd host key $(ssh-keygen -lf "$DOCKERD_HOST_KEY.pub" | awk '{print $2}')"
+  fi
+}
+
+# The public port of the app's TCP redirection, adding one if it has none.
+dockerd_redirection() {
+  local alias="$1" port out
+  port="$(clever tcp-redirs list --alias "$alias" --format json 2>/dev/null \
+    | jq -r '.[]? | .port // empty' | head -1)"
+  if [ -n "$port" ]; then
+    skip "tcp redirection on port $port" >&2
+    printf '%s' "$port"; return
+  fi
+  say "adding a tcp redirection (cleverapps namespace)" >&2
+  out="$(clever tcp-redirs add --namespace cleverapps --alias "$alias" 2>&1)"
+  port="$(clever tcp-redirs list --alias "$alias" --format json 2>/dev/null \
+    | jq -r '.[]? | .port // empty' | head -1)"
+  # Only if the listing still says nothing - the assigned port is printed
+  # on creation, but reading it back is the version that cannot misparse.
+  [ -n "$port" ] || port="$(printf '%s' "$out" | grep -oE '\b[0-9]{4,5}\b' | head -1)"
+  if [ -z "$port" ]; then
+    printf '%s\n' "$out" | tail -3 >&2
+    die "could not add a tcp redirection to $alias"
+  fi
+  ok "tcp redirection on port $port" >&2
+  printf '%s' "$port"
+}
+
+dockerd_hostname() {
+  local alias="$1" app_id="$2" h
+  h="$(clever domain --alias "$alias" --format json 2>/dev/null \
+    | jq -r '.[]? | select(.domain=="cleverapps.io") | .hostname' | head -1)"
+  [ -n "$h" ] || h="app-${app_id#app_}.cleverapps.io"
+  printf '%s' "$h"
+}
+
+# Creates or updates the companion for one VM and leaves its endpoint in
+# DOCKERD_ENDPOINT. Returns through a global rather than stdout so the
+# progress lines stay where every other step in this script prints them.
+provision_dockerd() {
+  local vm="$1" name app_id out flavor host port
+  name="$(dockerd_name "$vm")"
+  printf '\n\033[1m[%s]\033[0m\n' "$name"
+
+  app_id="$(app_id_by_name "$name")"
+  if [ -z "$app_id" ]; then
+    say "creating application (docker, $REGION)"
+    out="$(clever create --type docker "$name" ${ORG_ARGS[@]+"${ORG_ARGS[@]}"} \
+      --region "$REGION" --alias "$name" 2>&1)"
+    app_id="$(app_id_by_name "$name")"
+    if [ -z "$app_id" ]; then
+      printf '%s\n' "$out" | tail -5
+      die "could not create application $name"
+    fi
+    ok "application created: $app_id"
+  else
+    skip "application exists: $app_id"
+  fi
+
+  if is_linked_locally "$app_id"; then
+    skip "already linked to this repo"
+  else
+    clever link "$app_id" ${ORG_ARGS[@]+"${ORG_ARGS[@]}"} --alias "$name" >/dev/null 2>&1
+    is_linked_locally "$app_id" && ok "linked to this repo" \
+      || die "could not link $name to this repo"
+  fi
+
+  # Sized independently of the VM: this is where the test containers
+  # actually run, so it is the one that wants the memory.
+  flavor="$(clever status --alias "$name" --format json 2>/dev/null \
+    | jq -r '.instances[0].flavor // ""')"
+  if [ "$flavor" = "$DOCKERD_FLAVOR" ]; then
+    skip "flavor already $DOCKERD_FLAVOR"
+  elif clever scale --flavor "$DOCKERD_FLAVOR" --alias "$name" >/dev/null 2>&1; then
+    ok "scaled to $DOCKERD_FLAVOR"
+  else
+    die "could not scale $name to $DOCKERD_FLAVOR"
+  fi
+  clever scale --instances 1 --alias "$name" >/dev/null 2>&1
+
+  # CC_DOCKERFILE, because the repository root is a linux-runtime app and
+  # its Dockerfile lives out of the way. The build context is still the
+  # root, which is why the COPY inside it is dockerd/-prefixed.
+  ensure_env "$name" CC_MOUNT_DOCKER_SOCKET     "true"
+  ensure_env "$name" CC_DOCKERFILE              "dockerd/Dockerfile"
+  ensure_env "$name" DOCKERD_HOST_KEY_B64       "$(base64 -w0 < "$DOCKERD_HOST_KEY")"
+  ensure_env "$name" DOCKERD_AUTHORIZED_KEYS_B64 "$(base64 -w0 < "$DOCKERD_KEY.pub")"
+
+  host="$(dockerd_hostname "$name" "$app_id")"
+  port="$(dockerd_redirection "$name")"
+  DOCKERD_ENDPOINT="$host:$port"
+
+  deploy_app "$name"
+  ok "daemon at $DOCKERD_ENDPOINT"
+}
+
+# What the VM needs to reach its companion: where it is, the key to get in
+# with, and the host key to check it against.
+publish_dockerd_endpoint() {
+  local name="$1"
+  ensure_env "$name" VM_AGENT_DOCKERD          "$DOCKERD_ENDPOINT"
+  ensure_env "$name" VM_AGENT_DOCKERD_KEY_B64  "$(base64 -w0 < "$DOCKERD_KEY")"
+  ensure_env "$name" VM_AGENT_DOCKERD_HOSTKEY  "$(dockerd_known_hosts_line)"
+}
+
+# The known_hosts line the VM pins the companion with. Port-qualified,
+# because a redirection never lands on 22 and an unqualified entry would
+# simply not match.
+dockerd_known_hosts_line() {
+  printf '[%s]:%s %s' "${DOCKERD_ENDPOINT%%:*}" "${DOCKERD_ENDPOINT##*:}" \
+    "$(awk '{print $1" "$2}' "$DOCKERD_HOST_KEY.pub")"
+}
+
 # -------------------------------------------------------------- one VM
 provision_one() {
   local name="$1" config_id="$2"
@@ -531,38 +737,23 @@ provision_one() {
 
   prune_shadowing_env "$name"
 
+  # --- companion Docker daemon ------------------------------------------
+  # Set before this VM is deployed, so the box comes up with the endpoint
+  # already in its environment instead of needing a second restart to see
+  # it. Per-VM, deliberately: keeping it out of the shared Configuration
+  # provider means adding a daemon to one VM does not restart the fleet.
+  if $DOCKERD; then
+    provision_dockerd "$name"
+    printf '\n\033[1m[%s]\033[0m\n' "$name"
+    publish_dockerd_endpoint "$name"
+  fi
+
   # --- fleet registry ---------------------------------------------------
   touch "$FLEET_FILE"
   grep -qxF "$name" "$FLEET_FILE" || { echo "$name" >> "$FLEET_FILE"; ok "added to vms.txt"; }
 
   # --- deploy -----------------------------------------------------------
-  if $DEPLOY; then
-    local want out got
-    want="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
-    got="$(clever status --alias "$name" --format json 2>/dev/null | jq -r '.commit // ""')"
-
-    if [ -n "$want" ] && [ "$want" = "$got" ]; then
-      skip "already running $(printf '%.7s' "$want")"
-    else
-      say "deploying $(printf '%.7s' "$want")"
-      # --force: the Clever remote is a deploy target, not a source of
-      # truth, so a rewritten local history must win. --same-commit-policy
-      # restart makes a no-op deploy pick up changed environment instead
-      # of erroring.
-      out="$(clever deploy --alias "$name" --force --same-commit-policy restart 2>&1)"
-
-      # Judge by the commit the platform reports, not by the exit code or
-      # by grepping the log: a rejected push once slipped through both.
-      got="$(clever status --alias "$name" --format json 2>/dev/null | jq -r '.commit // ""')"
-      if [ -n "$want" ] && [ "$want" != "$got" ]; then
-        printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g' | tail -15
-        die "$name is running ${got:-nothing}, expected $want"
-      fi
-      ok "deployed $(printf '%.7s' "$want")"
-    fi
-  else
-    skip "deploy skipped (--no-deploy)"
-  fi
+  deploy_app "$name"
 
   printf '  %s\n' "https://app-${app_id#app_}.cleverapps.io/status"
 }
@@ -572,7 +763,7 @@ do_list() {
   hdr "fleet"
   [ -s "$FLEET_FILE" ] || { skip "no VMs provisioned yet"; return; }
   printf '  %-18s %-9s %-3s %-40s %s\n' NAME STATE SIZE APP_ID STATUS_URL
-  local name status state flavor id
+  local name status state flavor id dockerd
   while read -r name; do
     [ -n "$name" ] || continue
     status="$(clever status --alias "$name" --format json 2>/dev/null)"
@@ -585,6 +776,8 @@ do_list() {
     flavor="$(printf '%s' "$status" | jq -r '.instances[0].flavor // "?"')"
     printf '  %-18s %-9s %-3s %-40s %s\n' "$name" "$state" "$flavor" "$id" \
       "https://app-${id#app_}.cleverapps.io/status"
+    dockerd="$(env_value "$name" VM_AGENT_DOCKERD)"
+    [ -n "$dockerd" ] && printf '  %-18s %s\n' "" "$c_skip└ docker daemon: $dockerd$c_off"
   done < "$FLEET_FILE"
 }
 
@@ -610,7 +803,7 @@ purge_shared_addons() {
 }
 
 do_destroy() {
-  local name="$1" confirmed="$2"
+  local name="$1" confirmed="$2" companion
   $confirmed || die "refusing to destroy $name without --yes"
   hdr "destroying [$name]"
   # Storage and configuration are fleet-wide; only the application goes.
@@ -626,6 +819,13 @@ do_destroy() {
     clever delete --alias "$name" --yes >/dev/null 2>&1 && ok "deleted application $name"
   else
     skip "application $name does not exist"
+  fi
+  # The companion daemon is this VM's alone, so it goes with it - and it
+  # holds no state worth keeping, unlike the FS Bucket subtree above.
+  companion="$(dockerd_name "$name")"
+  if [ -n "$(app_id_by_name "$companion")" ]; then
+    clever delete --alias "$companion" --yes >/dev/null 2>&1 \
+      && ok "deleted companion daemon $companion"
   fi
   # Only replace the registry if grep actually succeeded or found no match
   # (exit 1). Any other failure once truncated vms.txt to nothing.
@@ -685,6 +885,9 @@ while [ $# -gt 0 ]; do
     --org|--owner) CLEVER_ORG="$2"; shift 2 ;;
     --key)      KEY_PATH="$2"; shift 2 ;;
     --per-vm-key) PER_VM_KEY=true; shift ;;
+    --dockerd)  DOCKERD=true; shift ;;
+    --dockerd-only) DOCKERD=true; DOCKERD_ONLY=true; shift ;;
+    --dockerd-flavor) DOCKERD_FLAVOR="$2"; shift 2 ;;
     --no-deploy)  DEPLOY=false; shift ;;
     --all)      ACTION="all"; shift ;;
     --list)     ACTION="list"; shift ;;
@@ -720,6 +923,27 @@ if [ "$ACTION" = provision ] || [ "$ACTION" = all ]; then
   canon="$(printf '%s\n' $FLAVORS | grep -ixF -- "$FLAVOR" | head -1)"
   [ -n "$canon" ] || die "unknown flavor '$FLAVOR' - pick one of: $FLAVORS"
   FLAVOR="$canon"
+
+  # The companion is deployed from git, so its Dockerfile has to be *in the
+  # commit*, not merely on disk. Uncommitted, the platform answers
+  # "mandatory Dockerfile named 'dockerd/Dockerfile' not found" - several
+  # minutes and one created application later, which is a bad way to find
+  # out that you forgot to commit.
+  if $DOCKERD && $DEPLOY \
+     && ! git -C "$ROOT" cat-file -e HEAD:dockerd/Dockerfile 2>/dev/null; then
+    die "dockerd/Dockerfile is not in HEAD - commit it first (clever deploys the commit, not the working tree)"
+  fi
+
+  # The docker runtime offers its own set - no pico, for one - so a size
+  # that is legal for a VM is not automatically legal for its companion.
+  if $DOCKERD; then
+    DFLAVORS="$(clever curl -s https://api.clever-cloud.com/v2/products/instances 2>/dev/null \
+      | jq -r '.[] | select(.variant.slug == "docker") | .flavors[].name' 2>/dev/null | paste -sd' ')"
+    [ -n "$DFLAVORS" ] || DFLAVORS="nano XS S M L XL 2XL 3XL"
+    canon="$(printf '%s\n' $DFLAVORS | grep -ixF -- "$DOCKERD_FLAVOR" | head -1)"
+    [ -n "$canon" ] || die "unknown dockerd flavor '$DOCKERD_FLAVOR' - pick one of: $DFLAVORS"
+    DOCKERD_FLAVOR="$canon"
+  fi
 fi
 
 # Resolve --org before anything is created. clever accepts a name, but a
@@ -793,8 +1017,26 @@ case "$ACTION" in
       fi
     fi
 
+    # Companions only: none of the fleet's shared storage or configuration
+    # is involved, so none of it is created or touched here.
+    if $DOCKERD_ONLY; then
+      hdr "companion daemons"
+      ensure_dockerd_keys
+      for n in ${TARGETS[@]+"${TARGETS[@]}"}; do
+        provision_dockerd "$n"
+        if [ -n "$(app_id_by_name "$n")" ]; then
+          printf '\n\033[1m[%s]\033[0m\n' "$n"
+          publish_dockerd_endpoint "$n"
+        else
+          skip "no VM named $n - nothing to point at $DOCKERD_ENDPOINT yet"
+        fi
+      done
+      exit 0
+    fi
+
     hdr "shared resources"
     $PER_VM_KEY || ensure_key "$KEY_PATH"
+    $DOCKERD && ensure_dockerd_keys
     CONFIG_ID="$(ensure_config_provider)"
     CELLAR_ID="$(ensure_shared_addon cellar-addon "$CELLAR_ADDON" S)"
     # Cellar bucket names are globally unique across the whole provider, so

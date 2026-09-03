@@ -13,6 +13,48 @@ BEGIN="<!-- >>> vm-agent toolbelt >>> -->"
 END="<!-- <<< vm-agent toolbelt <<< -->"
 
 mkdir -p "$HOME/.claude"
+
+# Only on a VM that has one - documenting a daemon that is not there would
+# send agents chasing a socket that will never appear.
+docker_section=""
+if [ -n "${VM_AGENT_DOCKERD:-}" ]; then
+  docker_section="$(cat <<'DOCKER'
+## Docker and Testcontainers
+
+This box has a working `DOCKER_HOST`, but **the daemon is not on this box** -
+it runs on a companion app and arrives over an ssh tunnel. Every shell gets
+the environment already; `docker ps` and Testcontainers just work.
+
+```sh
+docker ps                 # the companion's daemon
+./tunnel.sh status        # is the tunnel up, what is forwarded
+./tunnel.sh doctor        # start a real container and reach it, end to end
+./tunnel.sh restart       # if the socket ever goes quiet
+```
+
+Published ports are forwarded to **this VM's localhost at the same port
+number**, so `getHost()` + `getMappedPort()` resolve to something you can
+actually connect to, and no `TESTCONTAINERS_HOST_OVERRIDE` juggling is
+needed - it is set for you.
+
+Two things do not work, both because the daemon's filesystem is not this
+one:
+
+- **Bind mounts of local paths** (`-v $PWD:/x`, `withFileSystemBind`). The
+  path is resolved over there, where it does not exist. Copy instead:
+  `withCopyFileToContainer(MountableFile.forHostPath(...), ...)`, which
+  ships the bytes over the API.
+- **`Testcontainers.exposeHostPorts()`** - the reverse direction, a
+  container reaching a server running here. The tunnel is one-way.
+
+If a container starts and the test cannot reach it, check `./tunnel.sh
+status` first: the forward is added when the container starts, so a dead
+tunnel looks exactly like a broken test.
+
+DOCKER
+)"
+fi
+
 block="$(cat <<BLOCK
 $BEGIN
 # This machine
@@ -70,7 +112,7 @@ Use \`-p\` per project/repo. First use downloads a ~300MB embedding model
   every 5 minutes and on shutdown).
 - \`~/shared\` - a directory every VM in the fleet can read and write.
 
-## What persists
+$docker_section## What persists
 
 \`~/workspace\` is written straight through to network storage. Agent state
 (\`~/.claude\`, \`~/.codex\`, \`~/.moerae\`, herdr layout) is snapshotted to it.

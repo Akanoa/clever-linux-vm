@@ -138,7 +138,8 @@ variable of the same name overrides it, so a one-off
 
 Options: `--flavor`, `--region`, `--config <addon-name>`,
 `--cellar <addon-name>`, `--key <path>`, `--per-vm-key`, `--no-deploy`,
-`--no-roster`, `--forget <VAR>`.
+`--no-roster`, `--forget <VAR>`, `--dockerd` / `--dockerd-flavor` (see
+[Docker and Testcontainers](#docker-and-testcontainers)).
 
 Tokens come from `.secrets/tokens.env` (gitignored) or the surrounding
 environment. **An empty local token never blanks one already in the
@@ -158,8 +159,8 @@ busy check narrows to the VMs actually being deployed. Re-run without the
 flag once the fleet is quiet to publish the roster (that run restarts
 everything).
 
-`--destroy` removes an app and its own two add-ons, never the shared
-provider.
+`--destroy` removes an app, its companion Docker daemon if it has one, and
+its own two add-ons — never the shared provider.
 
 Nothing account-specific is tracked: `.clever.json`, `fleet.conf`,
 `vms.txt` and `.secrets/` are all gitignored, so this repository is safe to
@@ -358,6 +359,73 @@ Already in the base image: `git`, `node` 24, `bun`, `cargo`/`rustc`,
 Use `mise` for anything else (`mise use -g go@latest`) — there is no `sudo`
 and no `apt` on this runtime.
 
+## Docker and Testcontainers
+
+The `linux` runtime cannot run a container and cannot be made to: `/etc/subuid`
+is empty and `newuidmap` has no capabilities, so rootless podman never starts,
+and there is no daemon on the box to talk to. That rules out Testcontainers,
+which is most of a JVM or Go test suite's integration layer.
+
+Clever's *docker* runtime can, though. `--dockerd` gives a VM a companion
+application on that runtime with `CC_MOUNT_DOCKER_SOCKET=true`, so it talks to
+the daemon of the instance it runs on, and the VM borrows that daemon over an
+ssh tunnel:
+
+```bash
+./provision.sh --dockerd owl        # owl gets owl-dockerd, and the wiring
+```
+
+On the VM the tunnel is opened at boot and every shell inherits it:
+
+```bash
+docker ps                    # the companion's daemon
+./tunnel.sh status           # up? what is forwarded?
+./tunnel.sh doctor           # start a real container, reach it, prove the path
+```
+
+### Why it is a tunnel and not just a DOCKER_HOST
+
+Pointing `DOCKER_HOST` at a remote daemon gets you half a working setup. The
+API is the easy half; the containers are the problem. Testcontainers publishes
+each one on a port chosen when it starts, on the daemon's host — and a Clever
+application exposes exactly one HTTP port and one TCP port, neither of them
+that one.
+
+`ssh -L` solves it, but not the platform's own SSH: `clever ssh` is a gateway
+relay, and it refuses forwarding outright (`administratively prohibited`). So
+the companion runs its own sshd on 4040, where a TCP redirection delivers, and
+`tunnel.sh` opens two things against it:
+
+* **the API**, as a forwarded unix socket — the one address that never moves;
+* **every published port**, forwarded to the *same* port number on the VM's
+  loopback, added as the container starts.
+
+That second half is why this is more than a shell alias. `ssh -L` is static and
+the ports are not, so `tunnel.sh` watches the daemon's event stream and adds the
+forward when Testcontainers starts a container — the same trick a hosted
+Testcontainers agent plays. The upshot is that `getHost()` and
+`getMappedPort()` return something the VM can actually connect to, with no
+`TESTCONTAINERS_HOST_OVERRIDE` juggling.
+
+### What it does not do
+
+The daemon's filesystem is not the VM's, so **bind mounts of local paths**
+(`-v $PWD:/x`, `withFileSystemBind`) resolve over there, where nothing exists.
+Copy into the container instead — `withCopyFileToContainer(MountableFile…)`
+ships the bytes over the API. **`Testcontainers.exposeHostPorts()`** — a
+container reaching a server on the VM — is the reverse direction and is not
+forwarded.
+
+One companion per VM, not one per fleet: a shared daemon would let one agent
+list, reach and reap another agent's containers. The endpoint, the client key
+and the pinned host key live in the VM's *own* environment rather than the
+shared Configuration provider, so adding a daemon to one VM does not restart
+the fleet. `--destroy <vm>` takes the companion with it.
+
+The companion holds no state — it is rebuilt from `dockerd/Dockerfile` on every
+deploy — and prunes what Testcontainers leaks (by its `org.testcontainers`
+label, so the instance's own image cache is left alone).
+
 ## Storage model
 
 Two different mechanisms, because the FS Bucket is NFS-backed:
@@ -453,6 +521,9 @@ scripts/15-agent-auth.sh   agent credentials (claude / codex / opencode)
 scripts/20-toolchain.sh    installs the agents, herdr, gh, glab
 scripts/30-shell.sh        makes `clever ssh` sessions match the boot env
 scripts/40-herdr.sh        starts the headless herdr server
+scripts/45-dockerd.sh      credentials + tunnel for the companion daemon
+dockerd/Dockerfile         the companion daemon app (docker runtime)
+dockerd/entrypoint.sh      its sshd, health endpoint and janitor
 tools/cellar               s3cmd wrapper for the Cellar bucket
 tools/vm-snapshot          agent state -> FS Bucket
 tools/fleet                talk to the other VMs (runs on VM and laptop)
@@ -462,6 +533,7 @@ provision.sh               idempotent fleet provisioner (runs locally)
 agent-tokens.sh            fills .secrets/tokens.env (runs locally)
 fleet.conf.example         template for fleet.conf (gitignored)
 connect.sh                 local helper: ssh / herdr attach
+tunnel.sh                  borrow the companion's Docker daemon (runs on the VM)
 vms.txt                    fleet registry (gitignored)
 ```
 
