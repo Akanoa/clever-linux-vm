@@ -1,6 +1,6 @@
 ---
 name: vm-agent
-description: Provision and drive a fleet of long-lived coding agents (Claude Code, opencode, codex) on Clever Cloud VMs. Use when work should run somewhere that outlives this session - delegating a long task to another machine, running several agents in parallel, keeping a persistent dev box, or collecting results from agents running elsewhere.
+description: Provision and drive a fleet of long-lived coding agents (Claude Code, opencode, codex) on Clever Cloud VMs. Use when work should run somewhere that outlives this session - delegating a long task to another machine, running several agents in parallel, keeping a persistent dev box, or collecting results from agents running elsewhere. Also covers giving those VMs a working Docker daemon for Testcontainers, which the runtime cannot provide itself.
 metadata:
   author: Yannick Guern
   repository: https://github.com/Akanoa/clever-linux-vm
@@ -118,6 +118,60 @@ by `fleet fetch`. Use `task`/`fetch` whenever you need the output.
 
 `fleet out <vm>` lists what a VM has produced.
 
+## Docker and Testcontainers
+
+A fleet VM cannot run a container: the `linux` runtime has an empty subuid
+map and no cgroup delegation, so rootless podman never starts and there is
+no daemon to talk to. `--dockerd` gets around that by giving a VM a
+companion application on Clever's *docker* runtime with the instance's
+socket mounted, reached over an ssh tunnel:
+
+```bash
+./provision.sh --dockerd owl        # owl gains owl-dockerd, and the wiring
+./provision.sh --dockerd-only owl   # rebuild/repair the companion only
+```
+
+**It must be committed first.** The companion is deployed from git, so an
+uncommitted `dockerd/Dockerfile` is simply not there; `provision.sh` checks
+`HEAD` and says so before creating anything.
+
+On the VM the tunnel opens at boot and every shell inherits `DOCKER_HOST`:
+
+```bash
+docker ps                 # the companion's daemon
+./tunnel.sh status        # up? which ports are forwarded?
+./tunnel.sh doctor        # start a real container and reach it, end to end
+```
+
+Published ports are forwarded to the VM's own loopback **at the same port
+number**, so `getHost()`/`getMappedPort()` resolve to something locally
+connectable. Verified against a real suite: 466 of `clever-kms`'s 470
+Testcontainers-backed tests pass this way.
+
+Four things do not work, all because the daemon is on another machine:
+
+* **Bind mounts of local paths** (`-v $PWD:/x`, `withFileSystemBind`) —
+  resolved over there, where the path does not exist. Copy into the
+  container over the API instead.
+* **`exposeHostPorts()`** — a container reaching a server on the VM. The
+  tunnel is one-way.
+* **Containers that advertise an address of their own.** You reach the
+  published port, the service answers with its `172.17.0.x` bridge address,
+  and the test *hangs* rather than failing — no error, ever. FoundationDB
+  does this; `FDB_NETWORKING_MODE=host` makes it advertise loopback, which
+  matches the forward. Postgres, Redis and friends are unaffected.
+* **Bulk transfer through the API is slow.** `docker cp` of 24 MB takes
+  ~2 minutes; `docker export` of an image filesystem is unusable. Image
+  pulls are fine — they happen daemon-side.
+
+Under heavy parallelism a Docker API read can stall for ever (~0.6% of
+container cycles at `-j 6`), and Testcontainers sets no timeout there, so a
+stall wedges the run instead of failing it. Keep test concurrency moderate
+and set a per-test timeout.
+
+One companion per VM: a shared daemon would let one agent reach and reap
+another agent's containers. `--destroy <vm>` takes the companion with it.
+
 ## Storage
 
 * `~/workspace` → the shared FS Bucket, per-VM subtree. Repos and
@@ -144,6 +198,9 @@ by `fleet fetch`. Use `task`/`fetch` whenever you need the output.
   The VMs hold forge tokens and a push-capable commit key — that is the
   trade, and the user makes it in `fleet.conf`.
 * **No root, no package manager.** Use `mise` for extra runtimes.
+* **No container runtime on the VM itself.** Rootless podman and docker are
+  both dead here (empty subuid map, capless `newuidmap`, no cgroup
+  delegation). `--dockerd` borrows one instead — see above.
 * **The shared add-ons are found by name.** Changing `FLEET_NAME` or the
   `*_ADDON` values does not move storage, it abandons it: the old add-ons
   keep billing where nothing will look for them again. Purge before
@@ -179,6 +236,9 @@ again.
 | `fleet fetch` 404s | The agent has not written `~/out/<name>.md` yet, or ignored the instruction. Check with `fleet read`. |
 | Deploy refuses | An agent is mid-task. `--force` overrides and kills its pane. |
 | Adding a VM refuses because agents on *other* VMs are busy | The new name changes `VM_AGENT_FLEET`, and publishing it restarts every linked app. `--no-roster` creates and deploys the new VM without republishing, leaving the busy ones alone; re-run without it later to publish. |
+| `--dockerd` deploy fails with *mandatory Dockerfile not found* | The work is uncommitted. Clever deploys the commit, not the working tree. |
+| `docker ps` on a VM says the socket is missing | The tunnel is down. `./tunnel.sh status`, then `./tunnel.sh restart`; it supervises itself, so this usually means the companion app is down. |
+| A container starts and the test hangs with no error | Either the tunnel (check `./tunnel.sh status` for the forward) or a service advertising its own bridge address — see Docker and Testcontainers. |
 | Agent has no model access | No `CLAUDE_CODE_OAUTH_TOKEN` on the fleet. `./agent-tokens.sh claude`. |
 | An agent is listed but `prompt`/`keys` fail with *not an active named agent* | Something stamped a **reported agent label** on its pane (darwin does this when it takes one over). herdr treats that label as authoritative over its own live detection, and only *detected* agents accept input. `fleet read` still works. |
 | An agent vanishes from `fleet agents` entirely | Its pane lost its `name`. **`herdr pane release-agent` clears the reported stamp and the name with it** — the session keeps running, but an unnamed, undetected pane is invisible to the fleet API, so a live agent looks dead. Re-add it with `herdr agent rename <pane-id> <name>` (positional target first). |
