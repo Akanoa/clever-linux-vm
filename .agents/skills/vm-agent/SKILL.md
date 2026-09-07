@@ -87,8 +87,8 @@ files reused — one more VM in the fleet you are *already* driving is
 just `./provision.sh <name>` from where you already are, nothing new to
 set up.
 
-**Use `git clone`, sibling directory, one branch each — not
-`git worktree`.** Worktree looks like the obvious fit, since all four
+**Use `git clone` into `~/.fleets/<fleet>` — not `git worktree`, not a
+sibling directory.** Worktree looks like the obvious fit, since all four
 config files are gitignored and a worktree gets its own copies for
 free, but it does not actually work: `clever-tools` cannot resolve HEAD
 through a worktree's `.git` **file** pointer (confirmed live —
@@ -96,22 +96,24 @@ through a worktree's `.git` **file** pointer (confirmed live —
 `GIT_WORK_TREE` overrides do not help either). A local `git clone`
 sidesteps this at almost no extra cost: cloning from a local path
 hardlinks the object store by default, so it is cheap, and it gives
-`clever-tools` a real `.git` directory:
+`clever-tools` a real `.git` directory. `~/.fleets/` beats a sibling
+directory next to whichever checkout you happened to run this from —
+one predictable, checkout-independent place to look, not one that moves
+with wherever vm-agent was cloned:
 
 ```bash
-ls -d ../vm-agent-*/ 2>/dev/null               # existing fleets, if any
-git clone --branch <fleet> "$PWD" ../vm-agent-<fleet>   # new fleet, sibling directory
+ls ~/.fleets/ 2>/dev/null                          # existing fleets, if any
+git clone --branch <fleet> "$PWD" ~/.fleets/<fleet>   # new fleet
 # branch doesn't exist yet? plain clone, then: git checkout -b <fleet>
-cd ../vm-agent-<fleet> && ./new-fleet.sh
+cd ~/.fleets/<fleet> && ./new-fleet.sh
 ```
 
-**The sibling directory *is* the tracking mechanism** — `vm-agent-<fleet>`
-next to this checkout, discoverable with a plain `ls`. Before touching a
-fleet you have not driven yet this session, `ls -d ../vm-agent-*/` and
-`cd` into the matching one first — every command for that fleet
-(`new-fleet.sh`, `provision.sh`, `agent-tokens.sh`, `tools/fleet`)
-resolves its config relative to *its own* script location, not wherever
-you were a moment ago.
+**`~/.fleets/<fleet>` *is* the tracking mechanism** — discoverable with a
+plain `ls ~/.fleets/` from anywhere. Before touching a fleet you have not
+driven yet this session, `ls ~/.fleets/` and `cd` into the matching one
+first — every command for that fleet (`new-fleet.sh`, `provision.sh`,
+`agent-tokens.sh`, `tools/fleet`) resolves its config relative to *its
+own* script location, not wherever you were a moment ago.
 
 A clone's `.git/config` is entirely its own, so — unlike worktrees —
 there is no shared-remote collision to worry about: two fleets can both
