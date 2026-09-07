@@ -194,7 +194,7 @@ supervise() {
         -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
         -o ConnectTimeout=15 \
         -L "$SOCK:/var/run/docker.sock" \
-        "root@$HOST" &
+        "root@$HOST" 2>>"$LOG" &
     local ssh_pid=$!
 
     local waited=0
@@ -212,12 +212,19 @@ supervise() {
       tlog "tunnel closed"
     else
       kill "$ssh_pid" 2>/dev/null
-      tlog "could not open the tunnel (see $LOG); retrying in ${backoff}s"
+      # ssh's own words for it, on the line above this one in the log -
+      # without them the log said only that something failed, which is
+      # nothing to act on when the tunnel has been down for minutes.
+      tlog "could not open the tunnel; retrying in ${backoff}s"
     fi
 
     rm -rf "$FWDIR"
     sleep "$backoff"
-    [ "$backoff" -lt 60 ] && backoff=$((backoff * 2))
+    # Capped low on purpose. What takes the tunnel down is almost always
+    # the companion restarting, which is over in a minute or two - and a
+    # 64s cap then adds up to another minute of downtime after it is
+    # already back. Retrying costs one ssh attempt.
+    [ "$backoff" -lt 15 ] && backoff=$((backoff * 2))
   done
 }
 
