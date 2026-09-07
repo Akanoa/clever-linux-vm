@@ -80,9 +80,24 @@ install_helpers() {
   install -m 755 "$APP_HOME/tools/fleet"  "$HOME/.local/bin/fleet"
 }
 
+# ripwire - a ranked, deterministic repo map (call graph, churn, test
+# coverage) for coding agents. Prebuilt binary, installs into
+# $HOME/.local/bin by default - a better first move than grepping cold
+# through an unfamiliar repo. Linux x86-64/arm64 only; falls back to
+# nothing on an unsupported arch, which install.sh reports on stderr.
+install_ripwire() {
+  have ripwire && { log "ripwire already present ($(ripwire --version 2>&1 | head -1))"; return 0; }
+  # The installer refuses to guess an org/repo - it needs RIPWIRE_REPO
+  # spelled out, or it exits before downloading anything. It also confirms
+  # on /dev/tty before installing, which has nothing to read from during an
+  # unattended boot, so RIPWIRE_INSTALL_YES skips that prompt.
+  RIPWIRE_REPO=redhat-et/ripwire RIPWIRE_INSTALL_YES=1 \
+    bash -c "$(curl -fsSL https://raw.githubusercontent.com/redhat-et/ripwire/main/scripts/install.sh)"
+}
+
 # Downloads are independent; run them concurrently to keep boot short.
 pids=()
-for fn in install_herdr install_claude install_opencode install_codex install_gh install_glab install_moerae; do
+for fn in install_herdr install_claude install_opencode install_codex install_gh install_glab install_moerae install_ripwire; do
   ( step "$fn" "$fn" ) & pids+=($!)
 done
 for pid in "${pids[@]}"; do wait "$pid"; done
@@ -90,6 +105,6 @@ for pid in "${pids[@]}"; do wait "$pid"; done
 step install_helpers install_helpers || true
 
 log "installed:"
-for c in herdr claude opencode codex gh glab cellar fleet moerae; do
+for c in herdr claude opencode codex gh glab cellar fleet moerae ripwire; do
   printf '[vm-agent]   %-10s %s\n' "$c" "$(command -v "$c" 2>/dev/null || echo 'MISSING')"
 done

@@ -114,6 +114,29 @@ restores it. So:
 Use \`-p\` per project/repo. First use downloads a ~300MB embedding model
 (~12s); the model is deliberately not persisted, the memory is.
 
+## ripwire - use this instead of grep, not just when grep is hard
+
+This box has \`ripwire\`, a parsed symbol table and call graph, not a text
+scanner. **"Find every implementation of X", "who calls Y", "what tests
+cover Z" are ripwire's job, on this box, by default** - reaching for
+\`rg\`/\`grep\` first on one of these is the wrong call here, not a
+shortcut: ripwire answers from structure (it knows what is an \`impl\`,
+what encloses a match, what calls what) instead of scanning bytes.
+
+\`\`\`sh
+ripwire <dir> --regex='impl.*Visitable'  # every match, with its enclosing symbol + line
+ripwire <dir> --grep='exact text'        # same, literal instead of regex
+ripwire <dir> --callers=<symbol>         # who calls this
+ripwire <dir> --impact=<symbol>          # transitive blast radius of changing this
+ripwire <dir> --test-gate=<symbol>       # which tests must run
+ripwire <dir> --for="describe the task"  # ranked map of what's relevant
+\`\`\`
+
+\`<dir>\` is required (\`.\` for cwd). \`rg\`/\`grep\` is still the right tool
+for a literal search in something ripwire does not parse - prose, config,
+logs, or a language outside its ~20 (\`ripwire --help\` lists them) - but
+that is the exception here, not the default.
+
 ## Other tools here
 
 - \`cellar put|get|ls|url <key>\` - S3 bucket shared by the fleet, for files
