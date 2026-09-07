@@ -280,6 +280,18 @@ fleet out <vm>                     # list a VM's result files
 fleet get <vm> <path>              # raw GET against one VM's endpoint
 ```
 
+herdr 0.9.0 added `herdr machine` — a saved-SSH-connection manager for the
+interactive TUI, giving a human one window with a combined agent list
+across several machines. It is not a federation API: `herdr agent
+list`/`prompt`/`read` still take no remote target, and `--remote` still
+attaches to exactly one server. It could eventually replace `fleet attach`
+for a human looking at several VMs at once, but the address it would need
+per VM (`clever status --format json` → `ip`/`sshPort`, the same lookup
+`connect.sh --herdr` already does) goes stale on every redeploy with no
+"update" subcommand, only remove-and-re-add — and it does nothing for the
+scripted `task`/`prompt`/`fetch` path this file exists for. Worth
+revisiting once the feature has had a release or two to settle.
+
 ### Getting results back
 
 Do not read results off the terminal. Agent UIs **collapse tool output** —
