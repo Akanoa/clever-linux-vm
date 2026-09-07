@@ -176,15 +176,19 @@ env_value() {
 }
 
 # Set an env var only when its current value differs, so re-runs stay quiet
-# and do not trigger pointless restarts.
+# and do not trigger pointless restarts. Returns 0 when it changed the
+# value, 1 when it was already current - callers use this to decide
+# whether an already-running instance needs restarting to see it (setting
+# an env var does not restart anything by itself; see deploy_app).
 ensure_env() {
   local alias="$1" key="$2" want="$3"
   if [ "$(env_value "$alias" "$key")" = "$want" ]; then
     skip "env $key already set"
-  else
-    clever env set "$key" "$want" --alias "$alias" >/dev/null 2>&1 \
-      && ok "env $key set" || die "could not set $key"
+    return 1
   fi
+  clever env set "$key" "$want" --alias "$alias" >/dev/null 2>&1 \
+    && ok "env $key set" || die "could not set $key"
+  return 0
 }
 
 # --------------------------------------------------- shared storage
@@ -469,19 +473,30 @@ ensure_key() {
 # --------------------------------------------------------------- deploy
 # Shared by the VMs and by their companion daemons: both are this same
 # repository, pushed to different runtimes.
+#
+# $2 (default false): restart even when the commit already matches.
+# Setting an env var earlier in this run does not restart a running
+# instance by itself - confirmed live, an instance kept running with the
+# old environment until force-restarted - so a caller that changed one
+# passes true here rather than relying on the env change alone.
 deploy_app() {
-  local name="$1" want out got
+  local name="$1" force_restart="${2:-false}" want out got same_commit=false
+
   if ! $DEPLOY; then skip "deploy skipped (--no-deploy)"; return; fi
 
   want="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
   got="$(clever status --alias "$name" --format json 2>/dev/null | jq -r '.commit // ""')"
 
   if [ -n "$want" ] && [ "$want" = "$got" ]; then
-    skip "already running $(printf '%.7s' "$want")"
-    return
+    same_commit=true
+    if ! $force_restart; then
+      skip "already running $(printf '%.7s' "$want")"
+      return
+    fi
+    say "env changed - restarting $(printf '%.7s' "$want") to pick it up"
+  else
+    say "deploying $(printf '%.7s' "$want")"
   fi
-
-  say "deploying $(printf '%.7s' "$want")"
   # --force: the Clever remote is a deploy target, not a source of truth,
   # so a rewritten local history must win. --same-commit-policy restart
   # makes a no-op deploy pick up changed environment instead of erroring.
@@ -494,7 +509,11 @@ deploy_app() {
     printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g' | tail -15
     die "$name is running ${got:-nothing}, expected $want"
   fi
-  ok "deployed $(printf '%.7s' "$want")"
+  if $same_commit; then
+    ok "restarted on $(printf '%.7s' "$want")"
+  else
+    ok "deployed $(printf '%.7s' "$want")"
+  fi
 }
 
 # -------------------------------------------------- companion Docker daemon
@@ -606,26 +625,30 @@ provision_dockerd() {
   # CC_DOCKERFILE, because the repository root is a linux-runtime app and
   # its Dockerfile lives out of the way. The build context is still the
   # root, which is why the COPY inside it is dockerd/-prefixed.
-  ensure_env "$name" CC_MOUNT_DOCKER_SOCKET     "true"
-  ensure_env "$name" CC_DOCKERFILE              "dockerd/Dockerfile"
-  ensure_env "$name" DOCKERD_HOST_KEY_B64       "$(base64 -w0 < "$DOCKERD_HOST_KEY")"
-  ensure_env "$name" DOCKERD_AUTHORIZED_KEYS_B64 "$(base64 -w0 < "$DOCKERD_KEY.pub")"
+  local changed=false
+  ensure_env "$name" CC_MOUNT_DOCKER_SOCKET     "true"                             && changed=true
+  ensure_env "$name" CC_DOCKERFILE              "dockerd/Dockerfile"               && changed=true
+  ensure_env "$name" DOCKERD_HOST_KEY_B64       "$(base64 -w0 < "$DOCKERD_HOST_KEY")" && changed=true
+  ensure_env "$name" DOCKERD_AUTHORIZED_KEYS_B64 "$(base64 -w0 < "$DOCKERD_KEY.pub")" && changed=true
 
   host="$(dockerd_hostname "$name" "$app_id")"
   port="$(dockerd_redirection "$name")"
   DOCKERD_ENDPOINT="$host:$port"
 
-  deploy_app "$name"
+  deploy_app "$name" "$changed"
   ok "daemon at $DOCKERD_ENDPOINT"
 }
 
 # What the VM needs to reach its companion: where it is, the key to get in
-# with, and the host key to check it against.
+# with, and the host key to check it against. Returns 0 if it changed
+# anything (the caller then knows a restart is the only way an
+# already-running instance will see it), 1 if it was already current.
 publish_dockerd_endpoint() {
-  local name="$1"
-  ensure_env "$name" VM_AGENT_DOCKERD          "$DOCKERD_ENDPOINT"
-  ensure_env "$name" VM_AGENT_DOCKERD_KEY_B64  "$(base64 -w0 < "$DOCKERD_KEY")"
-  ensure_env "$name" VM_AGENT_DOCKERD_HOSTKEY  "$(dockerd_known_hosts_line)"
+  local name="$1" changed=false
+  ensure_env "$name" VM_AGENT_DOCKERD          "$DOCKERD_ENDPOINT"       && changed=true
+  ensure_env "$name" VM_AGENT_DOCKERD_KEY_B64  "$(base64 -w0 < "$DOCKERD_KEY")" && changed=true
+  ensure_env "$name" VM_AGENT_DOCKERD_HOSTKEY  "$(dockerd_known_hosts_line)"    && changed=true
+  $changed
 }
 
 # The known_hosts line the VM pins the companion with. Port-qualified,
@@ -726,26 +749,30 @@ provision_one() {
   # Only what genuinely differs per box lives here; everything shared comes
   # from the Configuration provider. CC_FS_BUCKET paths are resolved
   # relative to APP_HOME, hence the leading "/persistent".
-  ensure_env "$name" CC_FS_BUCKET  "/persistent:$FS_BUCKET_HOST"
-  ensure_env "$name" VM_AGENT_NAME "$name"
+  local env_changed=false
+  ensure_env "$name" CC_FS_BUCKET  "/persistent:$FS_BUCKET_HOST" && env_changed=true
+  ensure_env "$name" VM_AGENT_NAME "$name"                       && env_changed=true
 
   if $PER_VM_KEY; then
     local key_path="$SECRETS_DIR/$name/id_ed25519"
     ensure_key "$key_path"
-    ensure_env "$name" VM_AGENT_SSH_KEY_B64 "$(base64 -w0 < "$key_path")"
+    ensure_env "$name" VM_AGENT_SSH_KEY_B64 "$(base64 -w0 < "$key_path")" && env_changed=true
   fi
 
   prune_shadowing_env "$name"
 
   # --- companion Docker daemon ------------------------------------------
-  # Set before this VM is deployed, so the box comes up with the endpoint
-  # already in its environment instead of needing a second restart to see
-  # it. Per-VM, deliberately: keeping it out of the shared Configuration
-  # provider means adding a daemon to one VM does not restart the fleet.
+  # Set before this VM is deployed, so a brand-new box comes up with the
+  # endpoint already in its environment. An EXISTING VM gaining --dockerd
+  # is a different case deploy_app's env_changed flag exists for: its
+  # commit will not have changed, so without that flag the endpoint would
+  # sit unused until something else happened to restart the box. Per-VM,
+  # deliberately: keeping it out of the shared Configuration provider
+  # means adding a daemon to one VM does not restart the fleet.
   if $DOCKERD; then
     provision_dockerd "$name"
     printf '\n\033[1m[%s]\033[0m\n' "$name"
-    publish_dockerd_endpoint "$name"
+    publish_dockerd_endpoint "$name" && env_changed=true
   fi
 
   # --- fleet registry ---------------------------------------------------
@@ -753,7 +780,7 @@ provision_one() {
   grep -qxF "$name" "$FLEET_FILE" || { echo "$name" >> "$FLEET_FILE"; ok "added to vms.txt"; }
 
   # --- deploy -----------------------------------------------------------
-  deploy_app "$name"
+  deploy_app "$name" "$env_changed"
 
   printf '  %s\n' "https://app-${app_id#app_}.cleverapps.io/status"
 }
@@ -1026,7 +1053,17 @@ case "$ACTION" in
         provision_dockerd "$n"
         if [ -n "$(app_id_by_name "$n")" ]; then
           printf '\n\033[1m[%s]\033[0m\n' "$n"
-          publish_dockerd_endpoint "$n"
+          # deploy_app is not used here even for the same-commit-restart
+          # trick it offers elsewhere: --dockerd-only's own contract is
+          # "their code is not redeployed", and deploy_app pushes new code
+          # whenever the VM's commit differs from HEAD. A plain restart
+          # never touches code, so it is the only right tool for "restart
+          # this VM to pick up its new endpoint" here.
+          if publish_dockerd_endpoint "$n"; then
+            clever restart --alias "$n" --quiet >/dev/null 2>&1 \
+              && ok "restarted to pick up the new endpoint" \
+              || die "could not restart $n"
+          fi
         else
           skip "no VM named $n - nothing to point at $DOCKERD_ENDPOINT yet"
         fi
