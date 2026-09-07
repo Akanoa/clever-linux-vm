@@ -130,6 +130,8 @@ fleet fetch <vm>/<name>            # read that answer
 fleet read <vm>/<name> [-f]        # recent terminal output, -f to follow
 fleet prompt <vm>/<name> "..."     # a bare prompt, no result collection
 fleet keys <vm>/<name> esc         # unblock one waiting on a keypress
+fleet herdr <vm> <args>...         # any permitted herdr subcommand
+fleet abort <vm>/<name>            # interrupt it; retract an order in flight
 ```
 
 `kind` defaults to `claude`; `codex`, `opencode`, `gemini`, `cursor` and
@@ -145,6 +147,28 @@ fleet task agent-1/migrate "Port src/legacy/*.js to TypeScript. Run the tests."
 # ... later ...
 fleet fetch agent-1/migrate
 ```
+
+### Retracting an order
+
+`prompt` queues *behind* the work in flight, so a correction does not stop
+anything - the agent finishes the order you no longer want first. `fleet
+abort` is the way back:
+
+```bash
+fleet abort agent-1/migrate
+fleet abort agent-1/migrate --tell "cancelled - revert what you changed under src/"
+```
+
+It sends `esc`, waits for the agent to leave `working`, and sends a second
+`esc` if the first was swallowed. **Exit 0 once it is no longer working,
+exit 1 if it could not be stopped** - branch on that rather than on the
+text. Aborting an idle agent is a safe no-op.
+
+The pane survives deliberately: killing the agent would take its context and
+uncommitted work with it, and an interrupted one accepts a new order at once.
+It does *not* revert the working tree - use `--tell` to ask for that - and it
+cannot delete the result file of the cancelled order, so `fleet fetch` may
+still return the previous answer; `abort` warns when that file exists.
 
 ### Collect results as files, never off the terminal
 
@@ -211,6 +235,26 @@ and set a per-test timeout.
 
 One companion per VM: a shared daemon would let one agent reach and reap
 another agent's containers. `--destroy <vm>` takes the companion with it.
+
+## Reaching herdr itself
+
+herdr's API is a unix socket on the VM with no network listener, and the
+platform's ssh gateway refuses forwarding, so the fleet endpoint is the only
+way to it. `fleet herdr` passes argv straight through, so any verb a herdr
+release adds works without a redeploy:
+
+```bash
+fleet herdr <vm>                  # what is permitted, and the herdr version
+fleet herdr agent-1 pane list
+fleet herdr agent-1 api snapshot  # the whole live session state
+```
+
+Permitted: `agent`, `pane`, `tab`, `workspace`, `worktree`, `notification`,
+`api`, `session`. Refused: `server`/`config`/`channel`/`integration` (they
+change the box, not the session), anything `attach` (interactive - it would
+never return), and `session stop`/`session delete` (they take every agent on
+the VM with them). Those rules prevent accidents, not attackers: the fleet
+token already grants code execution through `fleet prompt`.
 
 ## Storage
 

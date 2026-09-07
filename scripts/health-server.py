@@ -63,6 +63,60 @@ def herdr(*args, timeout=30):
         }
 
 
+# ------------------------------------------------------------- herdr shim
+# herdr's own API is a unix socket, mode 0600, local to the VM - it has no
+# network listener at all, and the platform's ssh gateway refuses port
+# forwarding, so the socket cannot be reached from off the box. This shim
+# is the only way in, and hand-writing a route per verb meant every new
+# herdr subcommand needed a redeploy to become usable. So pass argv
+# through instead, and police it by namespace.
+#
+# What this is NOT is a security boundary. Anyone holding the fleet token
+# can already POST /agents/<name>/prompt to an agent running with
+# bypassPermissions, which is arbitrary code execution on this VM. The
+# rules below exist to stop *accidents* - a request that never returns, or
+# that takes the whole session down with it - not to contain an attacker.
+HERDR_NAMESPACES = {
+    "agent", "pane", "tab", "workspace", "worktree", "notification",
+    "api", "session",
+}
+# Excluded on purpose, because they change the box rather than the session:
+# server (stop/reload-config), config (reset-keys), channel (set), and
+# integration (install/uninstall).
+
+# Interactive: hands over a terminal and never returns, so it would hold a
+# request open until the timeout and give nothing back.
+HERDR_DENY_VERBS = {"attach"}
+
+# The session owns every workspace, pane and agent on the VM. Stopping or
+# deleting it is not a management operation, it is a teardown.
+HERDR_DENY_PAIRS = {("session", "stop"), ("session", "delete")}
+
+HERDR_MAX_ARGV = 24
+HERDR_MAX_ARG = 4096
+HERDR_MAX_TIMEOUT = 120
+
+
+def herdr_allowed(argv):
+    """(ok, reason) for a proposed herdr argv."""
+    if not argv or not all(isinstance(a, str) and a for a in argv):
+        return False, "argv must be a non-empty list of non-empty strings"
+    if len(argv) > HERDR_MAX_ARGV:
+        return False, f"argv is longer than {HERDR_MAX_ARGV}"
+    if any(len(a) > HERDR_MAX_ARG for a in argv):
+        return False, f"an argument is longer than {HERDR_MAX_ARG} bytes"
+    ns = argv[0]
+    if ns not in HERDR_NAMESPACES:
+        return False, (f"'{ns}' is not a permitted namespace; "
+                       f"allowed: {' '.join(sorted(HERDR_NAMESPACES))}")
+    verb = argv[1] if len(argv) > 1 else ""
+    if verb in HERDR_DENY_VERBS:
+        return False, f"'{ns} {verb}' is interactive and would never return"
+    if (ns, verb) in HERDR_DENY_PAIRS:
+        return False, f"'{ns} {verb}' would tear down the whole session"
+    return True, ""
+
+
 AGENT_KINDS = {
     "pi", "claude", "codex", "gemini", "cursor", "devin", "agy", "cline",
     "omp", "mastracode", "opencode", "copilot", "kimi", "kiro", "droid",
@@ -284,6 +338,18 @@ class Handler(BaseHTTPRequestHandler):
             with open(path, "rb") as fh:
                 return self._send(200, fh.read(), "text/plain; charset=utf-8")
 
+        if parts == ["herdr"]:
+            code, server = herdr("status", "server")
+            return self._json(200, {
+                "call": "POST /herdr with {\"argv\": [...], \"timeout\": seconds}",
+                "namespaces": sorted(HERDR_NAMESPACES),
+                "denied_verbs": sorted(HERDR_DENY_VERBS),
+                "denied": [" ".join(p) for p in sorted(HERDR_DENY_PAIRS)],
+                "max_argv": HERDR_MAX_ARGV,
+                "max_timeout": HERDR_MAX_TIMEOUT,
+                "server": server if code == 200 else {"error": server},
+            })
+
         if parts == ["agents"]:
             return self._json(*herdr("agent", "list"))
 
@@ -325,6 +391,19 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(label, str):
                 return self._json(400, {"error": "'label' must be a string"})
             return self._json(*start_agent(name, kind, cwd, label))
+
+        if parts == ["herdr"]:
+            argv = body.get("argv")
+            if not isinstance(argv, list):
+                return self._json(400, {"error": "'argv' must be a list of strings"})
+            ok, why = herdr_allowed(argv)
+            if not ok:
+                return self._json(400, {"error": why, "argv": argv})
+            timeout = body.get("timeout", 30)
+            if not isinstance(timeout, (int, float)) or not 1 <= timeout <= HERDR_MAX_TIMEOUT:
+                return self._json(400, {
+                    "error": f"'timeout' must be a number of seconds, 1..{HERDR_MAX_TIMEOUT}"})
+            return self._json(*herdr(*argv, timeout=timeout))
 
         if len(parts) == 3 and parts[0] == "agents" and parts[2] == "prompt":
             text = body.get("text")

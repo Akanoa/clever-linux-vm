@@ -274,11 +274,75 @@ fleet prompt <vm>/<name> "..."     # submit a prompt
 fleet read <vm>/<name> [-f]        # recent terminal output, -f to follow
 fleet attach <vm>[/<name>]         # attach the remote herdr UI, focusing that agent
 fleet keys <vm>/<name> 1           # answer a prompt the agent is blocked on
+fleet abort <vm>/<name>            # interrupt it; retract an order in flight
 fleet task <vm>/<name> "..."       # prompt, and collect the answer to a file
 fleet fetch <vm>/<name>            # print that file
+fleet herdr <vm> <args>...         # any permitted herdr subcommand
 fleet out <vm>                     # list a VM's result files
 fleet get <vm> <path>              # raw GET against one VM's endpoint
 ```
+
+### Retracting an order
+
+`prompt` queues *behind* whatever is running, so an orchestrator that changes
+its mind cannot simply send a correction — the agent finishes the work you no
+longer want first. `fleet abort` is the way back:
+
+```bash
+fleet abort api-agent/migrate
+fleet abort api-agent/migrate --tell "cancelled - revert what you changed under src/"
+fleet abort api-agent/migrate --timeout 60      # default is 20s
+```
+
+It sends `esc` — what a person would press — waits for the agent to leave
+`working`, and sends a second `esc` if the first was swallowed mid-tool-call.
+**Exit status is the contract**: `0` once the agent is no longer working (or
+already was not), `1` if it could not be stopped within the budget, so a script
+can branch on it. It is idempotent, so aborting an idle agent is a safe no-op.
+
+The pane survives on purpose. Killing the agent would take its context and its
+uncommitted work with it, and an interrupted agent can be given a new order
+immediately.
+
+Two things it deliberately does **not** do. It does not revert the working tree
+— the agent may have committed or pushed, and a blanket reset would take
+unrelated work with it; `--tell` is how you ask for an undo, as a normal prompt
+the agent can act on. And it cannot remove a result file from a cancelled order,
+so `~/out/<name>.md` may still hold the previous answer and `fleet fetch` would
+return it as though it were fresh — `abort` warns when that file exists.
+
+### Reaching herdr itself
+
+herdr's own API is a unix socket (`~/.config/herdr/herdr.sock`, mode 0600) with
+no network listener at all, and the platform's ssh gateway refuses port
+forwarding — so `scripts/health-server.py` on :8080 is the only way to it from
+off the box. It used to carry one hand-written route per verb, which meant any
+herdr subcommand it had not anticipated needed a code change and a redeploy.
+
+It now passes argv through instead:
+
+```bash
+fleet herdr <vm>                        # what is permitted, and the herdr version
+fleet herdr kms agent list
+fleet herdr kms pane list
+fleet herdr kms api snapshot            # the whole live session state
+fleet herdr kms workspace create --cwd ~/workspace --label review
+```
+
+A verb added by a future herdr release works immediately, with no redeploy.
+
+Eight namespaces are permitted — `agent`, `pane`, `tab`, `workspace`,
+`worktree`, `notification`, `api`, `session`. Excluded because they change the
+box rather than the session: `server`, `config`, `channel`, `integration`. Two
+further refusals: anything `attach` (interactive — it would hold the request
+open and return nothing), and `session stop` / `session delete` (they take every
+agent on the VM down with them).
+
+**That list is not a security boundary, and should not be read as one.** Anyone
+holding the fleet token can already `fleet prompt` an agent running with
+`bypassPermissions`, which is arbitrary code execution on the VM. The rules stop
+*accidents* — a request that never returns, a teardown issued by mistake — not
+an attacker who has the token.
 
 herdr 0.9.0 added `herdr machine` — a saved-SSH-connection manager for the
 interactive TUI, giving a human one window with a combined agent list

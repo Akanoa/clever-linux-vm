@@ -14,9 +14,11 @@
 #   fleet attach <vm>[/<agent>]      attach the remote herdr UI (focus that agent)
 #   fleet prompt <vm>/<agent> "..."  submit a prompt
 #   fleet keys <vm>/<agent> esc      send key presses
+#   fleet abort <vm>/<agent>         interrupt whatever it is doing
 #   fleet task <vm>/<agent> "..."    prompt, and collect the answer to a file
 #   fleet fetch <vm>/<agent>         print that file
 #   fleet out <vm>                   list a VM's result files
+#   fleet herdr <vm> <args>...       run any permitted herdr subcommand
 #   fleet get <vm> <path>            raw GET against one VM's endpoint
 set -uo pipefail
 
@@ -83,6 +85,10 @@ json_has() {  # $1.. jq args (filter last); JSON on stdin
   local doc; doc="$(cat)"
   [ -n "$doc" ] || return 1
   printf '%s' "$doc" | jq -e "$@" >/dev/null 2>&1
+}
+
+agent_status() {  # $1 vm, $2 agent -> idle | working | blocked | (empty if unreachable)
+  call GET "$1" "/agents/$2" 2>/dev/null | jq -r '.result.agent.agent_status // empty'
 }
 
 split_target() {  # vm/agent -> sets TGT_VM, TGT_AGENT
@@ -236,11 +242,105 @@ not read. Then print one line: WROTE ~/out/$out"
     call POST "$TGT_VM" "/agents/$TGT_AGENT/prompt" \
       "$(jq -nc --arg t "$full" '{text:$t}')" \
       | jq -r '"submitted; collect with: fleet fetch '"$TGT_VM/$TGT_AGENT"'"' ;;
+  abort)
+    # Retract an order. An orchestrator that changes its mind has no way
+    # back otherwise: `prompt` queues *behind* the work in flight, so the
+    # agent finishes the thing you no longer want first.
+    #
+    # esc is what a person would press, and it is the only interrupt that
+    # leaves the pane usable - killing the agent would take its context
+    # and its uncommitted work with it. That is deliberately not what this
+    # does; see --tell for undoing what it already did.
+    split_target "${2:?usage: fleet abort <vm>/<agent> [--tell \"...\"] [--timeout N]}"
+    shift 2
+    tell=""; budget=20
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --tell)    tell="${2:?--tell needs a message}"; shift 2 ;;
+        --timeout) budget="${2:?--timeout needs seconds}"; shift 2 ;;
+        *)         die "unknown option for abort: $1" ;;
+      esac
+    done
+
+    st="$(agent_status "$TGT_VM" "$TGT_AGENT")"
+    [ -n "$st" ] || die "$TGT_VM/$TGT_AGENT is unreachable, or not a named agent
+    a pane whose name was cleared is invisible here even while it runs:
+    check with 'fleet agents', and re-add it on the VM with
+    'herdr agent rename <pane-id> $TGT_AGENT'"
+
+    if [ "$st" = working ] || [ "$st" = blocked ]; then
+      # Half the budget per attempt: one esc is usually enough, but an
+      # agent mid-tool-call can swallow the first.
+      half=$(( budget / 2 )); [ "$half" -lt 3 ] && half=3
+      stopped=false
+      for attempt in 1 2; do
+        out="$(call POST "$TGT_VM" "/agents/$TGT_AGENT/keys" '{"keys":["esc"]}')"
+        if printf '%s' "$out" | json_has '.error'; then
+          die "could not send esc to $TGT_VM/$TGT_AGENT: $(printf '%s' "$out" | jq -r '.error')
+    only agents herdr *detects* accept input; one carrying a reported
+    label does not. 'fleet read' still works."
+        fi
+        printf '%s\n' "$c_dim  esc sent (attempt $attempt), waiting up to ${half}s…$c_off" >&2
+        waited=0
+        while [ "$waited" -lt "$half" ]; do
+          sleep 1; waited=$(( waited + 1 ))
+          st="$(agent_status "$TGT_VM" "$TGT_AGENT")"
+          case "$st" in
+            working|blocked) ;;
+            "")              ;;   # a blip in reachability is not an answer
+            *)               stopped=true; break ;;
+          esac
+        done
+        $stopped && break
+      done
+
+      if ! $stopped; then
+        printf '%s\n' "$c_err  $TGT_VM/$TGT_AGENT is still $st after ${budget}s - not aborted$c_off" >&2
+        printf '%s\n' "$c_dim  look at it with: fleet read $TGT_VM/$TGT_AGENT$c_off" >&2
+        exit 1
+      fi
+      printf '%s\n' "$c_ok  aborted - $TGT_VM/$TGT_AGENT is $st$c_off"
+    else
+      printf '%s\n' "$c_dim  $TGT_VM/$TGT_AGENT was already $st - nothing to interrupt$c_off"
+    fi
+
+    # A result file from the order you just cancelled still answers
+    # `fleet fetch`, and looks exactly like a fresh one. Say so, because an
+    # orchestrator that retries and then fetches would otherwise read the
+    # abandoned answer as the new one.
+    if call GET "$TGT_VM" /out 2>/dev/null \
+         | json_has --arg f "$TGT_AGENT.md" '.files[]? | select(.name == $f)'; then
+      printf '%s\n' "$c_dim  note: ~/out/$TGT_AGENT.md still holds the previous answer -$c_off"
+      printf '%s\n' "$c_dim        'fleet fetch $TGT_VM/$TGT_AGENT' would return it$c_off"
+    fi
+
+    # Interrupting stops the work; it does not tell the agent why, and it
+    # does not undo what already happened on disk. --tell is how you say
+    # both - it is a normal prompt, so the agent can act on it.
+    if [ -n "$tell" ]; then
+      call POST "$TGT_VM" "/agents/$TGT_AGENT/prompt" \
+        "$(jq -nc --arg t "$tell" '{text:$t}')" >/dev/null
+      printf '%s\n' "$c_ok  told it: $tell$c_off"
+    fi ;;
   fetch)
     split_target "${2:?usage: fleet fetch <vm>/<agent> [file]}"
     call GET "$TGT_VM" "/out/${3:-$TGT_AGENT.md}" ;;
   out)
     call GET "${2:?usage: fleet out <vm>}" /out | jq -r '.files[]? | "\(.bytes)\t\(.name)"' ;;
+  herdr)
+    # herdr's own API is a unix socket on the VM with no network listener,
+    # and the platform's ssh gateway refuses forwarding - so this endpoint
+    # is the only way to reach it from off the box. Passing argv through
+    # means a verb added by a herdr release works immediately, with no
+    # redeploy; `fleet herdr <vm>` alone says which ones are permitted.
+    vm="${2:?usage: fleet herdr <vm> <args>...   (no args: what is permitted)}"
+    shift 2
+    if [ $# -eq 0 ]; then
+      call GET "$vm" /herdr | jq .
+    else
+      call POST "$vm" /herdr \
+        "$(printf '%s\n' "$@" | jq -Rsc 'split("\n") | map(select(length>0)) | {argv:.}')" | jq .
+    fi ;;
   get)
     call GET "${2:?usage: fleet get <vm> <path>}" "${3:?usage: fleet get <vm> <path>}" ;;
   ls)  vm_names ;;
