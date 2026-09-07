@@ -79,6 +79,44 @@ Tokens go in `.secrets/tokens.env`, never on a command line:
 ./provision.sh --all --no-deploy       # push to the fleet
 ```
 
+## A second fleet — a local clone, not `git worktree`
+
+"New fleet" for a **different project** means a second
+`fleet.conf`/`vms.txt`/`.secrets`/`.clever.json`, not the same four
+files reused — one more VM in the fleet you are *already* driving is
+just `./provision.sh <name>` from where you already are, nothing new to
+set up.
+
+**Use `git clone`, sibling directory, one branch each — not
+`git worktree`.** Worktree looks like the obvious fit, since all four
+config files are gitignored and a worktree gets its own copies for
+free, but it does not actually work: `clever-tools` cannot resolve HEAD
+through a worktree's `.git` **file** pointer (confirmed live —
+`clever deploy` fails with *"Could not find HEAD"*, `GIT_DIR`/
+`GIT_WORK_TREE` overrides do not help either). A local `git clone`
+sidesteps this at almost no extra cost: cloning from a local path
+hardlinks the object store by default, so it is cheap, and it gives
+`clever-tools` a real `.git` directory:
+
+```bash
+ls -d ../vm-agent-*/ 2>/dev/null               # existing fleets, if any
+git clone --branch <fleet> "$PWD" ../vm-agent-<fleet>   # new fleet, sibling directory
+# branch doesn't exist yet? plain clone, then: git checkout -b <fleet>
+cd ../vm-agent-<fleet> && ./new-fleet.sh
+```
+
+**The sibling directory *is* the tracking mechanism** — `vm-agent-<fleet>`
+next to this checkout, discoverable with a plain `ls`. Before touching a
+fleet you have not driven yet this session, `ls -d ../vm-agent-*/` and
+`cd` into the matching one first — every command for that fleet
+(`new-fleet.sh`, `provision.sh`, `agent-tokens.sh`, `tools/fleet`)
+resolves its config relative to *its own* script location, not wherever
+you were a moment ago.
+
+A clone's `.git/config` is entirely its own, so — unlike worktrees —
+there is no shared-remote collision to worry about: two fleets can both
+have a VM named the same thing with no conflict.
+
 ## Driving agents
 
 ```bash
