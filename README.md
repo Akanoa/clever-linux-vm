@@ -428,10 +428,12 @@ except the FS Bucket, so this is re-run each time — it takes ~60s):
 
 `herdr`, `claude`, `opencode`, `codex`, `gh`, `glab`, [`ripwire`][ripwire] —
 a ranked, deterministic repo map (call graph, churn, test coverage) for
-agents, a better first move than grepping cold — plus the `cellar` and
-`vm-snapshot` helpers.
+agents, a better first move than grepping cold — [`specify`][speckit] —
+spec-driven development, for a feature worth planning rather than
+improvising — plus the `cellar` and `vm-snapshot` helpers.
 
 [ripwire]: https://github.com/redhat-et/ripwire
+[speckit]: https://github.com/github/spec-kit
 
 Already in the base image: `git`, `node` 24, `bun`, `cargo`/`rustc`,
 `python3`, `mise`, `tmux`, `zsh`, `jq`, `rg`, `fd`, `rsync`, `s3cmd`.

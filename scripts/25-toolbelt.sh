@@ -137,6 +137,22 @@ for a literal search in something ripwire does not parse - prose, config,
 logs, or a language outside its ~20 (\`ripwire --help\` lists them) - but
 that is the exception here, not the default.
 
+## speckit - when the task is big enough to plan
+
+\`specify\` writes a spec -> plan -> tasks workflow into a repo as slash
+commands you then run. Worth it for a feature you would otherwise
+improvise across a dozen files; overkill for a one-file fix.
+
+\`\`\`sh
+specify init . --integration claude   # into the repo you are already in
+specify init <name> --integration claude
+specify check                         # what it can see on this box
+\`\`\`
+
+**Always pass \`--integration\`.** Without it \`init\` opens an interactive
+picker, and there is nobody at the keyboard here to answer it - the pane
+just sits there. \`--here\` is the older spelling of \`.\` and still works.
+
 ## Other tools here
 
 - \`cellar put|get|ls|url <key>\` - S3 bucket shared by the fleet, for files

@@ -95,9 +95,23 @@ install_ripwire() {
     bash -c "$(curl -fsSL https://raw.githubusercontent.com/redhat-et/ripwire/main/scripts/install.sh)"
 }
 
+# speckit - GitHub's spec-driven development toolkit. `specify` writes a
+# spec/plan/tasks workflow into a repo as slash commands the agent then
+# runs, which is the difference between planning a large feature and
+# improvising it across a dozen files.
+#
+# uv is already in the base image and resolves its own Python, so there is
+# nothing to bootstrap: measured at well under a second on a live VM,
+# against ~60s for the rest of this script.
+install_speckit() {
+  have specify && { log "specify already present ($(specify --version 2>&1 | head -1))"; return 0; }
+  have uv || { log "uv is missing from the base image - cannot install specify"; return 1; }
+  uv tool install --quiet specify-cli
+}
+
 # Downloads are independent; run them concurrently to keep boot short.
 pids=()
-for fn in install_herdr install_claude install_opencode install_codex install_gh install_glab install_moerae install_ripwire; do
+for fn in install_herdr install_claude install_opencode install_codex install_gh install_glab install_moerae install_ripwire install_speckit; do
   ( step "$fn" "$fn" ) & pids+=($!)
 done
 for pid in "${pids[@]}"; do wait "$pid"; done
@@ -105,6 +119,6 @@ for pid in "${pids[@]}"; do wait "$pid"; done
 step install_helpers install_helpers || true
 
 log "installed:"
-for c in herdr claude opencode codex gh glab cellar fleet moerae ripwire; do
+for c in herdr claude opencode codex gh glab cellar fleet moerae ripwire specify; do
   printf '[vm-agent]   %-10s %s\n' "$c" "$(command -v "$c" 2>/dev/null || echo 'MISSING')"
 done
