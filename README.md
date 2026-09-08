@@ -181,6 +181,21 @@ is the way to change one afterwards.
 ./provision.sh --all --no-deploy       # apply to the fleet
 ```
 
+`set` takes the value from stdin when stdin is not a terminal, so a token
+already on disk never has to be echoed or pasted:
+
+```bash
+sed -n '/^\[registries\.kellnr\]/,/^\[/{s/^token[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p}' \
+  ~/.cargo/credentials.toml | ./agent-tokens.sh set CARGO_REGISTRIES_KELLNR_TOKEN
+```
+
+Beyond the fixed list, any `CARGO_REGISTRIES_<NAME>_TOKEN` is accepted and
+travels to the fleet, so a private cargo registry needs no change here. The
+registry's **index URL is not a secret** and belongs in the project's own
+`.cargo/config.toml`; only the token goes through the config provider. On
+the VM it arrives as an ordinary application variable, which `~/.vm-agent-rc`
+sources into every pane, so `cargo` finds it with no further setup.
+
 Deleting a VM leaves the shared add-ons alone, because they belong to the
 whole fleet — which also means `--destroy --all` on its own leaves the
 Cellar bucket, the FS Bucket and the config provider running and billing.

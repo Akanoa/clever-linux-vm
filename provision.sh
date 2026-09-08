@@ -384,6 +384,19 @@ SHARED_SECRETS=(
 # Non-secret settings, always taken from the local configuration.
 SHARED_SETTINGS=(GITLAB_HOST GIT_USER_NAME GIT_USER_EMAIL GIT_SIGN_COMMITS CELLAR_BUCKET VM_AGENT_FLEET CLAUDE_PERMISSION_MODE)
 
+# Private cargo registries cannot be listed in advance - the registry name
+# is part of the variable. Collected from both sides on every run: from the
+# environment so a token captured locally travels, and from the provider so
+# a machine that does not hold one does not silently drop it from the fleet
+# (the loop below treats "not in this list" as "delete", not as "keep").
+DYNAMIC_SECRET_RE='^CARGO_REGISTRIES_[A-Z0-9_]+_TOKEN$'
+dynamic_secret_names() {
+  {
+    compgen -v | grep -E "$DYNAMIC_SECRET_RE"
+    printf '%s' "${1:-[]}" | jq -r '.[]?.name' | grep -E "$DYNAMIC_SECRET_RE"
+  } 2>/dev/null | sort -u
+}
+
 # Writes the fleet-wide variables. Changing a value restarts every linked app.
 sync_shared_config() {
   local id="$1" current desired var want key
@@ -416,7 +429,7 @@ sync_shared_config() {
   add_var VM_AGENT_FLEET   "$roster"
   add_var CLAUDE_PERMISSION_MODE "$CLAUDE_PERMISSION_MODE_VALUE"
 
-  for var in "${SHARED_SECRETS[@]}"; do
+  for var in "${SHARED_SECRETS[@]}" $(dynamic_secret_names "$current"); do
     # --forget is the only way to take a secret back out: an empty local
     # value means "keep what the provider has", not "delete it".
     if [ "${#FORGET[@]}" -gt 0 ] && printf '%s\n' "${FORGET[@]}" | grep -qxF "$var"; then
@@ -447,7 +460,8 @@ sync_shared_config() {
 # the provider now owns must be cleared from the app.
 prune_shadowing_env() {
   local alias="$1" key
-  for key in VM_AGENT_SSH_KEY_B64 "${SHARED_SETTINGS[@]}" "${SHARED_SECRETS[@]}"; do
+  for key in VM_AGENT_SSH_KEY_B64 "${SHARED_SETTINGS[@]}" "${SHARED_SECRETS[@]}" \
+             ${DYNAMIC_SECRETS[@]+"${DYNAMIC_SECRETS[@]}"}; do
     $PER_VM_KEY && [ "$key" = VM_AGENT_SSH_KEY_B64 ] && continue
     if clever env --format json --alias "$alias" 2>/dev/null \
         | json_has --arg k "$key" '.env[]? | select(.name==$k)'; then
@@ -1075,6 +1089,13 @@ case "$ACTION" in
     $PER_VM_KEY || ensure_key "$KEY_PATH"
     $DOCKERD && ensure_dockerd_keys
     CONFIG_ID="$(ensure_config_provider)"
+    # Read once here rather than per VM: prune_shadowing_env runs for every
+    # box and each call would otherwise be another round trip.
+    DYNAMIC_SECRETS=()
+    while read -r n; do [ -n "$n" ] && DYNAMIC_SECRETS+=("$n"); done \
+      < <(dynamic_secret_names "$(cp_read "$CONFIG_ID")")
+    [ "${#DYNAMIC_SECRETS[@]}" -gt 0 ] \
+      && say "extra shared secrets: ${DYNAMIC_SECRETS[*]}"
     CELLAR_ID="$(ensure_shared_addon cellar-addon "$CELLAR_ADDON" S)"
     # Cellar bucket names are globally unique across the whole provider, so
     # a friendly name like "vm-agent-files" collides with other tenants and

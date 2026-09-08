@@ -11,6 +11,17 @@
 #   ./agent-tokens.sh set  <VAR>      prompt for a value without echoing it
 #   ./agent-tokens.sh unset <VAR>     remove it
 #
+# `set` reads the value from stdin when it is not a terminal, so a token
+# already on disk goes straight in without ever being echoed:
+#
+#     sed -n '...' ~/.cargo/credentials.toml \
+#       | ./agent-tokens.sh set CARGO_REGISTRIES_KELLNR_TOKEN
+#
+# Besides the fixed list below, any CARGO_REGISTRIES_<NAME>_TOKEN is
+# accepted, so a private cargo registry works without editing this script.
+# The registry's index URL is not a secret and belongs in the project's own
+# .cargo/config.toml; only the token travels through here.
+#
 # codex has no equivalent: a ChatGPT-subscription login's OAuth refresh
 # token rotates on every use, so sharing one captured file breaks it on
 # the very first real request elsewhere. Run `codex login --device-auth`
@@ -51,10 +62,23 @@ init_store() {
   chmod 600 "$TOKENS"
 }
 
+# The allowlist is here to catch typos, not to be exhaustive: a name that
+# follows cargo's own CARGO_REGISTRIES_<NAME>_TOKEN spelling is just as
+# unambiguous as a fixed entry, and the registry name cannot be enumerated
+# in advance.
+DYNAMIC_RE='^CARGO_REGISTRIES_[A-Z0-9_]+_TOKEN$'
+
 is_known() {
   local var
   for entry in "${KNOWN[@]}"; do var="${entry%%:*}"; [ "$var" = "$1" ] && return 0; done
-  return 1
+  printf '%s' "$1" | grep -qE "$DYNAMIC_RE"
+}
+
+# Names stored in the file that are not in KNOWN, so `show` lists what it
+# holds rather than only what it was compiled with.
+stored_dynamic() {
+  sed -n 's/^export \([A-Z0-9_]*\)=".*"$/\1/p' "$TOKENS" 2>/dev/null \
+    | grep -E "$DYNAMIC_RE" | sort -u
 }
 
 get() { sed -n "s/^export $1=\"\(.*\)\"$/\1/p" "$TOKENS" 2>/dev/null | tail -1; }
@@ -87,15 +111,28 @@ do_show() {
       printf '  %s·%s %-26s %-22s %s\n' "$c_dim" "$c_off" "$var" "—" "$c_dim$desc$c_off"
     fi
   done
+  for var in $(stored_dynamic); do
+    value="$(get "$var")"
+    printf '  %s✓%s %-26s %-22s %s\n' "$c_ok" "$c_off" "$var" "$(mask "$value")" \
+      "$c_dim""private cargo registry""$c_off"
+  done
   printf '\n  apply with: ./provision.sh --all --no-deploy\n\n'
 }
 
 do_set() {
   local var="$1" value
   is_known "$var" || die "unknown variable: $var (see ./agent-tokens.sh)"
-  printf '  value for %s (input hidden): ' "$var"
-  read -rs value; printf '\n'
-  [ -n "$value" ] || die "empty value - nothing stored"
+  if [ -t 0 ]; then
+    printf '  value for %s (input hidden): ' "$var"
+    read -rs value; printf '\n'
+  else
+    # Piped in. Trim whitespace, and take the first line only: a `sed` that
+    # matched twice would otherwise store the second value silently.
+    read -r value
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+  fi
+  [ -n "$value" ] || die "empty value - nothing stored (stdin gave nothing)"
   put "$var" "$value"
   ok "$var stored: $(mask "$value")"
 }
