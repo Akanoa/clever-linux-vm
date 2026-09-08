@@ -85,10 +85,19 @@ configure_glab() {
     return 0
   fi
   local host="${GITLAB_HOST:-gitlab.com}"
-  # glab picks GITLAB_TOKEN up from the environment; persisting it in the
-  # config file too keeps `glab` working inside herdr panes that were
-  # spawned before the variable existed.
-  glab config set -h "$host" token "$GITLAB_TOKEN" >/dev/null 2>&1 || true
+  # `glab config set -h <host> token` stores a token but never registers
+  # the host, and `glab auth status` only reports on hosts it knows about -
+  # so on a *fresh* VM it announced "gitlab.corp... has not been
+  # authenticated" in the boot log while `glab api user` worked perfectly
+  # off the environment variable. Existing VMs hid this: their config had
+  # picked up a host entry from some earlier interactive login, so the bug
+  # only ever showed on the first boot of a new box.
+  #
+  # `auth login --token` registers the host, which is what status reads. It
+  # warns that GITLAB_TOKEN takes precedence over what it just stored -
+  # that is fine and is what we want: the env stays the source of truth,
+  # this only teaches glab the host exists.
+  glab auth login --hostname "$host" --token "$GITLAB_TOKEN" >/dev/null 2>&1 || true
   glab config set -h "$host" git_protocol ssh >/dev/null 2>&1 || true
   glab auth status 2>&1 | sed 's/^/[glab] /' || log "glab auth check failed"
 }
