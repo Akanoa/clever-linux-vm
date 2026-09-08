@@ -186,9 +186,23 @@ def accept_bypass_warning(name):
     text = json.dumps(out)
     if "Bypass Permissions mode" not in text or "Yes, I accept" not in text:
         return False
-    herdr("agent", "send-keys", name, "2")
-    time.sleep(3)
-    return True
+    # An arrow-key menu defaulting to "No, exit", with no numeric shortcuts
+    # on Claude Code 2.x - so the "2" this used to send did nothing, and the
+    # first agent on every freshly provisioned VM sat on this screen for
+    # ever. It never showed on an existing box: ~/.claude.json already
+    # records the acceptance and is restored from the bucket, so only a
+    # brand-new fleet could reveal it. Older builds did number the options,
+    # so "2" is kept as a fallback.
+    #
+    # Confirm the screen actually cleared rather than assuming the keys
+    # landed - assuming is what made the previous version fail silently.
+    for keys in (("down", "enter"), ("2",)):
+        herdr("agent", "send-keys", name, *keys)
+        time.sleep(3)
+        code, out = herdr("agent", "read", name, "--source", "visible")
+        if code == 200 and "Bypass Permissions mode" not in json.dumps(out):
+            return True
+    return False
 
 
 def read_stage():
