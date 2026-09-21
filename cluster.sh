@@ -328,21 +328,44 @@ ensure_deploy_token() {
   fi
   say "creating a read_registry deploy token on $IMAGE_PROJECT"
   local out user token
+  # -F, not -f. `glab api` builds a JSON body rather than a form, so the
+  # Rails-style `-f "scopes[]=read_registry"` produces a key literally
+  # named "scopes[]" - which GitLab ignores, and then rejects the request
+  # with "scopes is missing" as though the caller had forgotten it. -F
+  # infers the type and the value lands where the API looks for it.
   out="$(glab api --hostname "$GITLAB_HOST_VALUE" --method POST \
     "/projects/$PROJECT_ID/deploy_tokens" \
     -f "name=vm-agent-k8s" -f "username=vm-agent-k8s" \
-    -f "scopes[]=read_registry" 2>&1)"
+    -F "scopes=read_registry" 2>&1)"
   user="$(printf '%s' "$out" | jq -r '.username // empty' 2>/dev/null)"
   token="$(printf '%s' "$out" | jq -r '.token // empty' 2>/dev/null)"
   if [ -z "$token" ]; then
     printf '%s\n' "$out" | tail -3 >&2
-    warn "could not create a deploy token - falling back to GITLAB_TOKEN for pulls."
-    warn "  that token can do everything your account can; prefer a deploy token"
-    warn "  (Settings → Repository → Deploy tokens, scope read_registry) and put it"
-    warn "  in .secrets/registry.env as K8S_REGISTRY_USER / K8S_REGISTRY_TOKEN."
-    [ -n "${GITLAB_TOKEN:-}" ] || die "no GITLAB_TOKEN either - nothing to pull the image with"
+    # A deploy token is shown exactly once, at creation, so a name that is
+    # already taken cannot be recovered - only replaced.
+    if printf '%s' "$out" | grep -qi 'already been taken\|already exists'; then
+      warn "a deploy token named vm-agent-k8s already exists on $IMAGE_PROJECT,"
+      warn "  and GitLab only ever shows one at creation - so this one cannot be"
+      warn "  read back. Delete it (Settings → Repository → Deploy tokens) and"
+      warn "  re-run, or put the copy you kept into .secrets/registry.env as"
+      warn "  K8S_REGISTRY_USER / K8S_REGISTRY_TOKEN."
+    else
+      warn "could not create a deploy token - falling back to the push credential."
+      warn "  that token can do everything your account can, and the cluster keeps"
+      warn "  it in a namespace secret; prefer a deploy token (Settings → Repository"
+      warn "  → Deploy tokens, scope read_registry) in .secrets/registry.env as"
+      warn "  K8S_REGISTRY_USER / K8S_REGISTRY_TOKEN."
+    fi
+    # The credential that just pushed the image is by definition one that
+    # works against this registry. Insisting on GITLAB_TOKEN here would
+    # refuse the very token the push succeeded with, which is how this
+    # first showed up: "no GITLAB_TOKEN either" on a run that had just
+    # pushed perfectly well using glab's.
+    resolve_push_token
     K8S_REGISTRY_USER="$(gitlab_user)"
-    K8S_REGISTRY_TOKEN="$GITLAB_TOKEN"
+    K8S_REGISTRY_TOKEN="$PUSH_TOKEN"
+    [ -n "$K8S_REGISTRY_USER" ] && [ -n "$K8S_REGISTRY_TOKEN" ] \
+      || die "no credential left to pull the image with"
     return 0
   fi
   K8S_REGISTRY_USER="$user"; K8S_REGISTRY_TOKEN="$token"
