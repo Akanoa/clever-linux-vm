@@ -46,7 +46,10 @@
 #   ./cluster.sh create              # cluster + .secrets/kubeconfig.yaml
 #   ./provision.sh --all --no-deploy # publish it to the fleet, when quiet
 #
-# After which every VM has kubectl, a kubeconfig and `swarm`.
+# After which every VM has kubectl, a kubeconfig and `swarm`. That second
+# line is only for fleets that *have* VMs: `swarm` reads the cluster from
+# .secrets/k8s.env here, so a pod-only fleet is already done after the
+# first one, and `--all` would only tell you the roster is empty.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -151,6 +154,25 @@ ensure_feature() {
     || die "could not enable the k8s feature - 'clever features enable k8s'"
 }
 
+# Whether this fleet has any long-lived boxes. It decides what the "next"
+# hints should say: publishing the kubeconfig and image to the shared
+# configuration is how a *VM* learns to drive the cluster, and a fleet
+# with no VMs has nobody to tell - the local .secrets/k8s.env is already
+# everything `swarm` needs here.
+fleet_has_vms() { [ -s "$ROOT/vms.txt" ]; }
+
+# The command that hands the cluster's coordinates to whatever needs them,
+# or nothing at all when nothing does.
+publish_hint() {
+  if fleet_has_vms; then
+    printf '  %s\n' "./provision.sh --all --no-deploy   $1"
+  else
+    printf '%s\n' "$c_skip  no VMs in this fleet, so there is nothing to publish to -$c_off"
+    printf '%s\n' "$c_skip  swarm reads .secrets/k8s.env directly. Add a VM later and$c_off"
+    printf '%s\n' "$c_skip  ./provision.sh --all --no-deploy gives it the cluster too.$c_off"
+  fi
+}
+
 cluster_json() {
   clever k8s get "$CLUSTER" ${ORG_ARGS[@]+"${ORG_ARGS[@]}"} --format json 2>/dev/null
 }
@@ -223,7 +245,7 @@ cmd_create() {
   cmd_bootstrap
   hdr "next"
   printf '  %s\n' "./cluster.sh image                 build and publish the agent image"
-  printf '  %s\n' "./provision.sh --all --no-deploy   hand the kubeconfig to the VM fleet"
+  publish_hint "hand the kubeconfig to the VM fleet"
   printf '  %s\n' "swarm run hello 'say hi'           (once the image exists)"
 }
 
@@ -514,7 +536,12 @@ cmd_image() {
     skip "no kubeconfig yet - run ./cluster.sh bootstrap once the cluster exists"
   fi
   hdr "next"
-  printf '  %s\n' "./provision.sh --all --no-deploy   publish K8S_IMAGE to the fleet"
+  publish_hint "publish K8S_IMAGE to the fleet"
+  if [ -s "$KUBECONFIG_PATH" ]; then
+    printf '  %s\n' "swarm run hello 'reply with the word ok' --wait"
+  else
+    printf '  %s\n' "./cluster.sh create                the cluster to run it on"
+  fi
 }
 
 # So `swarm` works from this machine too, not just from a VM where the
@@ -769,8 +796,13 @@ cmd_destroy() {
   clever k8s delete "$CLUSTER" ${ORG_ARGS[@]+"${ORG_ARGS[@]}"} --yes >/dev/null 2>&1 \
     && ok "cluster deleted" || die "could not delete $CLUSTER"
   rm -f "$KUBECONFIG_PATH" && skip "removed .secrets/kubeconfig.yaml"
-  warn "the VMs still carry VM_AGENT_KUBECONFIG_B64. Clear it with:"
-  warn "  ./provision.sh --all --no-deploy --forget VM_AGENT_KUBECONFIG_B64"
+  if fleet_has_vms; then
+    warn "the VMs still carry VM_AGENT_KUBECONFIG_B64. Clear it with:"
+    warn "  ./provision.sh --all --no-deploy --forget VM_AGENT_KUBECONFIG_B64"
+  else
+    warn "the shared config may still carry VM_AGENT_KUBECONFIG_B64. Clear it with:"
+    warn "  ./provision.sh --shared-only --forget VM_AGENT_KUBECONFIG_B64"
+  fi
   warn "The GitLab project and its images are untouched."
 }
 

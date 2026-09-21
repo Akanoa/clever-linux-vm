@@ -617,8 +617,15 @@ it creates no VM. A pod reads the fleet's secrets — the agent tokens, the
 commit key, the fleet token — from the shared Configuration provider, so
 that add-on has to exist; it is free, and `--shared-only` creates it, the
 Cellar bucket and nothing else. **A fleet whose agents are all pods never
-creates a box.** If you do also run VMs, `./provision.sh --all --no-deploy`
-afterwards hands them the kubeconfig so they can spawn pods too.
+creates a box.**
+
+There is no fourth step. `swarm` reads the cluster out of
+`.secrets/kubeconfig.yaml` and `.secrets/k8s.env`, both written by
+`cluster.sh`, so a pod-only fleet is ready at that point. Publishing the
+kubeconfig to the shared configuration — `./provision.sh --all
+--no-deploy` — is how a **VM** learns to drive the cluster, and is worth
+running only once you have one. On an empty roster `--all` has nothing to
+apply to and says so.
 
 `cluster.sh` is idempotent the way `provision.sh` is: every step checks the
 state it wants before touching anything. `./cluster.sh doctor` walks the

@@ -1153,7 +1153,16 @@ case "$ACTION" in
       do_destroy "${NAMES[0]}" "$CONFIRMED"
     fi ;;
   all|provision)
-    [ "$ACTION" = all ] && { [ -s "$FLEET_FILE" ] || die "vms.txt is empty - provision a VM first"; }
+    # --all means "every VM on the roster", so an empty roster is not a
+    # thing it can do. It is, however, exactly what a pod-only fleet looks
+    # like - and such a fleet still has shared configuration to publish -
+    # so name the command that does that rather than insisting on a box.
+    [ "$ACTION" = all ] && { [ -s "$FLEET_FILE" ] || die "vms.txt is empty, so --all has no VMs to apply to.
+    If this fleet runs its agents as pods, the shared configuration is
+    still yours to publish, and it needs no VM:
+      ./provision.sh --shared-only
+    Otherwise create one first:
+      ./provision.sh <name>"; }
     [ "$ACTION" = provision ] && [ "${#NAMES[@]}" -eq 0 ] && usage 1
 
     # The VMs this run will deploy, expanded once so the busy check and the
