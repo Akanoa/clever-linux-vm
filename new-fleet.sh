@@ -539,3 +539,9 @@ note "./tools/fleet start <vm> <name>      launch an agent"
 note "./tools/fleet attach <vm>/<name>     drive it in herdr"
 note "./provision.sh --destroy --all --yes tear the fleet down"
 printf '\n'
+note "For disposable agents rather than long-lived boxes, this fleet can also"
+note "drive a Clever Cloud Kubernetes cluster:"
+note "./cluster.sh create                  the cluster, once (it bills while it exists)"
+note "./cluster.sh image                   the agent image, into your GitLab registry"
+note "swarm run <name> \"do this\" --wait    one agent, one answer, gone"
+printf '\n'

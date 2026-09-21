@@ -45,7 +45,11 @@ die() { printf '%s%s%s\n' "$c_err" "fleet: $*" "$c_off" >&2; exit 1; }
 # machine that has no fleet yet. Print the whole leading comment, not a
 # fixed line range - that silently drops the last options as soon as
 # anyone adds one.
-if [ "${1:-}" = -h ] || [ "${1:-}" = --help ]; then
+# `fleet <verb> --help` as well as `fleet --help`: the second is what gets
+# typed once the verb is known, and without this it is parsed as the
+# verb's first argument and dies about the next one.
+if [ "${1:-}" = -h ] || [ "${1:-}" = --help ] \
+   || [ "${2:-}" = -h ] || [ "${2:-}" = --help ]; then
   awk 'NR > 1 { if (/^#/) { sub(/^# ?/, ""); print } else { exit } }' "$0"
   exit 0
 fi

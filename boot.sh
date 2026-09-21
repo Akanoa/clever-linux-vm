@@ -59,6 +59,9 @@ bash "$APP_HOME/scripts/40-herdr.sh"     || log "herdr step reported errors"
 stage "dockerd"
 bash "$APP_HOME/scripts/45-dockerd.sh"   || log "dockerd step reported errors"
 
+stage "kube"
+bash "$APP_HOME/scripts/50-kube.sh"      || log "kube step reported errors"
+
 stage "ready"
 log "ready - attach with: clever ssh --app ${CC_APP_NAME:-vm-agent}   then run: herdr"
 

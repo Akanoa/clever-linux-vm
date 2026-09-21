@@ -14,12 +14,19 @@
 #   ./provision.sh web-agent                 create or update one VM named 'web-agent'
 #   ./provision.sh agent --count 4           agent-1 .. agent-4
 #   ./provision.sh --all                     re-apply to every VM in vms.txt
+#   ./provision.sh --shared-only             the shared add-ons and config, no VM
 #   ./provision.sh --list                    show the fleet
 #   ./provision.sh --destroy agent-3 --yes   tear one down
 #   ./provision.sh --destroy --all --yes     tear the whole fleet down
 #   ./provision.sh --destroy --all --purge --yes   ... and the shared add-ons
 #   ./provision.sh --all --forget OPENAI_API_KEY   drop a shared secret
 #   ./provision.sh --dockerd owl                   give owl a Docker daemon
+#
+# Kubernetes needs no flag here. ./cluster.sh builds the cluster and leaves
+# .secrets/kubeconfig.yaml and K8S_IMAGE/K8S_NAMESPACE in fleet.conf; this
+# script picks all three up and publishes them, because publishing to the
+# shared configuration restarts every VM and the check for who is mid-task
+# lives here. After that every box has kubectl, a kubeconfig and `swarm`.
 #
 # Options
 #   --flavor <size>   pico nano XS S M L XL 2XL 3XL - the VM size. Applies
@@ -42,6 +49,12 @@
 #   --dockerd-only    build or repair the companions only, leaving the VMs
 #                     alone. Their code is not redeployed; a VM that exists
 #                     still has its endpoint refreshed, which restarts it.
+#   --shared-only     create and publish only what the whole fleet shares -
+#                     the Configuration provider, the Cellar bucket, the
+#                     commit key and the fleet token - and no VM. This is
+#                     all a Kubernetes cluster needs, so a fleet whose
+#                     agents are all pods never has to create a box. The
+#                     FS Bucket is skipped too: only a VM mounts one.
 #   --no-deploy       apply configuration, but do not push code
 #   --key <path>      commit key to use (default .secrets/id_ed25519)
 #   --per-vm-key      give each VM its own commit key instead of sharing one
@@ -83,6 +96,8 @@ FLAVOR_EXPLICIT=false
 FLAVOR="${FLAVOR:-M}"
 REGION="${REGION:-par}"
 KEY_PATH="${KEY_PATH:-$SECRETS_DIR/id_ed25519}"
+# Written by ./cluster.sh. Absent simply means this fleet has no cluster.
+KUBECONFIG_PATH="${KUBECONFIG_PATH:-$SECRETS_DIR/kubeconfig.yaml}"
 PER_VM_KEY=false
 DEPLOY=true
 COUNT=1
@@ -384,6 +399,15 @@ SHARED_SECRETS=(
 # Non-secret settings, always taken from the local configuration.
 SHARED_SETTINGS=(GITLAB_HOST GIT_USER_NAME GIT_USER_EMAIL GIT_SIGN_COMMITS CELLAR_BUCKET VM_AGENT_FLEET CLAUDE_PERMISSION_MODE)
 
+# The Kubernetes side. Sticky rather than a plain setting: these are
+# derived by ./cluster.sh, which may have run on another machine or under
+# another checkout, so "I do not have a local value" has to mean "keep
+# what the fleet already has" and not "delete it" - the same rule the
+# secrets below follow. --forget is still the way to take one back out.
+# The kubeconfig belongs in this list on its own merits: it is a
+# credential, and it grants whatever the cluster grants.
+SHARED_STICKY=(VM_AGENT_KUBECONFIG_B64 VM_AGENT_K8S_NAMESPACE VM_AGENT_K8S_IMAGE)
+
 # Private cargo registries cannot be listed in advance - the registry name
 # is part of the variable. Collected from both sides on every run: from the
 # environment so a token captured locally travels, and from the provider so
@@ -429,7 +453,15 @@ sync_shared_config() {
   add_var VM_AGENT_FLEET   "$roster"
   add_var CLAUDE_PERMISSION_MODE "$CLAUDE_PERMISSION_MODE_VALUE"
 
-  for var in "${SHARED_SECRETS[@]}" $(dynamic_secret_names "$current"); do
+  # The cluster's credentials, if this checkout holds them. Each is read
+  # by the loop below through ${!var}, so setting the shell variable is
+  # all there is to do - and leaving it unset is what makes the provider's
+  # copy survive a run from a machine that never saw the cluster.
+  [ -s "$KUBECONFIG_PATH" ] && VM_AGENT_KUBECONFIG_B64="$(base64 -w0 < "$KUBECONFIG_PATH")"
+  VM_AGENT_K8S_NAMESPACE="${K8S_NAMESPACE:-}"
+  VM_AGENT_K8S_IMAGE="${K8S_IMAGE:-}"
+
+  for var in "${SHARED_SECRETS[@]}" "${SHARED_STICKY[@]}" $(dynamic_secret_names "$current"); do
     # --forget is the only way to take a secret back out: an empty local
     # value means "keep what the provider has", not "delete it".
     if [ "${#FORGET[@]}" -gt 0 ] && printf '%s\n' "${FORGET[@]}" | grep -qxF "$var"; then
@@ -461,7 +493,7 @@ sync_shared_config() {
 prune_shadowing_env() {
   local alias="$1" key
   for key in VM_AGENT_SSH_KEY_B64 "${SHARED_SETTINGS[@]}" "${SHARED_SECRETS[@]}" \
-             ${DYNAMIC_SECRETS[@]+"${DYNAMIC_SECRETS[@]}"}; do
+             "${SHARED_STICKY[@]}" ${DYNAMIC_SECRETS[@]+"${DYNAMIC_SECRETS[@]}"}; do
     $PER_VM_KEY && [ "$key" = VM_AGENT_SSH_KEY_B64 ] && continue
     if clever env --format json --alias "$alias" 2>/dev/null \
         | json_has --arg k "$key" '.env[]? | select(.name==$k)'; then
@@ -799,6 +831,61 @@ provision_one() {
   printf '  %s\n' "https://app-${app_id#app_}.cleverapps.io/status"
 }
 
+# Everything the fleet shares, created and published. $1 = whether to
+# create the FS Bucket, which only a VM ever mounts - a fleet whose agents
+# are all pods has no use for one, and an unused bucket still bills.
+#
+# Sets CONFIG_ID, CELLAR_ID, FS_ID, FS_BUCKET_HOST, FLEET_ROSTER,
+# DYNAMIC_SECRETS and VM_AGENT_FLEET_TOKEN for the caller.
+prepare_shared() {
+  local with_fs="${1:-true}" n cellar_real
+  hdr "shared resources"
+  $PER_VM_KEY || ensure_key "$KEY_PATH"
+  $DOCKERD && ensure_dockerd_keys
+  # These three log progress to stderr and return the id on stdout, so
+  # they have to be called in a substitution - which means the `die`
+  # inside them exits the subshell and nothing else. Without a check here
+  # a failed create carries on with an empty id and fails again, further
+  # down, as something that reads like a different problem. Check the
+  # result, not the exit status.
+  CONFIG_ID="$(ensure_config_provider)"
+  [ -n "$CONFIG_ID" ] || die "could not create or find the Configuration provider $CONFIG_ADDON"
+  # Read once here rather than per VM: prune_shadowing_env runs for every
+  # box and each call would otherwise be another round trip.
+  DYNAMIC_SECRETS=()
+  while read -r n; do [ -n "$n" ] && DYNAMIC_SECRETS+=("$n"); done \
+    < <(dynamic_secret_names "$(cp_read "$CONFIG_ID")")
+  [ "${#DYNAMIC_SECRETS[@]}" -gt 0 ] \
+    && say "extra shared secrets: ${DYNAMIC_SECRETS[*]}"
+  CELLAR_ID="$(ensure_shared_addon cellar-addon "$CELLAR_ADDON" S)"
+  [ -n "$CELLAR_ID" ] || die "could not create or find the Cellar add-on $CELLAR_ADDON"
+  # Cellar bucket names are globally unique across the whole provider, so
+  # a friendly name like "vm-agent-files" collides with other tenants and
+  # survives a teardown as an unreachable 409/403. Deriving it from the
+  # add-on's own id makes it unique, and makes a recreated add-on get a
+  # fresh bucket rather than inherit a name it cannot open.
+  if [ -z "$CELLAR_BUCKET_NAME" ]; then
+    cellar_real="$(addon_real_id_by_name "$CELLAR_ADDON")"
+    CELLAR_BUCKET_NAME="vm-agent-$(printf '%s' "${cellar_real#cellar_}" | tr -d - | cut -c1-12)"
+    [ "$CELLAR_BUCKET_NAME" = "vm-agent-" ] && die "could not derive a Cellar bucket name"
+  fi
+  if [ "$with_fs" = true ]; then
+    FS_ID="$(ensure_shared_addon fs-bucket "$FS_ADDON" s)"
+    [ -n "$FS_ID" ] || die "could not create or find the FS Bucket $FS_ADDON"
+    FS_BUCKET_HOST="$(clever addon env "$FS_ID" --format json 2>/dev/null | jq -r '.BUCKET_HOST // ""')"
+    [ -n "$FS_BUCKET_HOST" ] || die "could not read BUCKET_HOST for $FS_ADDON"
+  else
+    skip "FS Bucket not created - only a VM mounts one (the first VM will)"
+  fi
+  touch "$FLEET_FILE"
+  FLEET_ROSTER="$(build_fleet_roster)"
+  VM_AGENT_FLEET_TOKEN="$(ensure_fleet_token "$(cp_read "$CONFIG_ID" \
+    | jq -r '.[]? | select(.name=="VM_AGENT_FLEET_TOKEN") | .value' | head -1)")"
+  export VM_AGENT_FLEET_TOKEN
+  sync_shared_config "$CONFIG_ID"
+  write_local_fleet_env
+}
+
 # --------------------------------------------------------------- actions
 do_list() {
   hdr "fleet"
@@ -820,6 +907,13 @@ do_list() {
     dockerd="$(env_value "$name" VM_AGENT_DOCKERD)"
     [ -n "$dockerd" ] && printf '  %-18s %s\n' "" "$c_skip└ docker daemon: $dockerd$c_off"
   done < "$FLEET_FILE"
+
+  # The cluster is fleet-wide, so it is reported once rather than per VM.
+  if [ -s "$KUBECONFIG_PATH" ] || [ -n "${K8S_IMAGE:-}" ]; then
+    hdr "kubernetes"
+    printf '  %s\n' "${c_skip}namespace ${K8S_NAMESPACE:-vm-agent}   image ${K8S_IMAGE:-<none - ./cluster.sh image>}$c_off"
+    printf '  %s\n' "${c_skip}what is running: swarm ls$c_off"
+  fi
 }
 
 # The shared add-ons belong to the whole fleet, so this is only ever safe
@@ -931,6 +1025,7 @@ while [ $# -gt 0 ]; do
     --dockerd-flavor) DOCKERD_FLAVOR="$2"; shift 2 ;;
     --no-deploy)  DEPLOY=false; shift ;;
     --all)      ACTION="all"; shift ;;
+    --shared-only) ACTION="shared"; shift ;;
     --list)     ACTION="list"; shift ;;
     --destroy)
                 ACTION="destroy"
@@ -1011,6 +1106,32 @@ fi
 
 case "$ACTION" in
   list)    do_list ;;
+  shared)
+    # The shared add-ons and the shared configuration, and nothing else.
+    # They are what the *fleet* is, in the sense that matters: the agent
+    # tokens, the commit key and the fleet token all live in the
+    # Configuration provider, and a Kubernetes cluster needs exactly those
+    # - it has no use for a VM, and no way to reach an FS Bucket either.
+    # So a fleet whose agents are all pods starts here and never creates a
+    # box at all.
+    #
+    # Still guarded by the busy check: writing the shared configuration
+    # restarts every linked application, which on a fleet that does have
+    # VMs kills whatever their agents were doing.
+    $FORCE || busy_agents || die "aborted to protect running agents"
+    prepare_shared false
+    hdr "ready"
+    if cp_read "$CONFIG_ID" \
+         | json_has '.[] | select(.name | test("CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY")) | select(.value != "")'; then
+      skip "an agent credential is published - agents will have model access"
+    else
+      printf '%s\n' "$c_err  ! no CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY in the shared config.$c_off" >&2
+      printf '%s\n' "$c_err    Agents will start and have no model access. Fix with:$c_off" >&2
+      printf '%s\n' "$c_err      ./agent-tokens.sh claude    then re-run this$c_off" >&2
+    fi
+    printf '  %s\n' "./cluster.sh create     a Kubernetes cluster for pod agents"
+    printf '  %s\n' "./provision.sh <name>   a VM, if you want a long-lived box too"
+    ;;
   destroy)
     if $DESTROY_ALL; then
       $CONFIRMED || die "refusing to destroy the whole fleet without --yes"
@@ -1032,7 +1153,16 @@ case "$ACTION" in
       do_destroy "${NAMES[0]}" "$CONFIRMED"
     fi ;;
   all|provision)
-    [ "$ACTION" = all ] && { [ -s "$FLEET_FILE" ] || die "vms.txt is empty - provision a VM first"; }
+    # --all means "every VM on the roster", so an empty roster is not a
+    # thing it can do. It is, however, exactly what a pod-only fleet looks
+    # like - and such a fleet still has shared configuration to publish -
+    # so name the command that does that rather than insisting on a box.
+    [ "$ACTION" = all ] && { [ -s "$FLEET_FILE" ] || die "vms.txt is empty, so --all has no VMs to apply to.
+    If this fleet runs its agents as pods, the shared configuration is
+    still yours to publish, and it needs no VM:
+      ./provision.sh --shared-only
+    Otherwise create one first:
+      ./provision.sh <name>"; }
     [ "$ACTION" = provision ] && [ "${#NAMES[@]}" -eq 0 ] && usage 1
 
     # The VMs this run will deploy, expanded once so the busy check and the
@@ -1085,38 +1215,7 @@ case "$ACTION" in
       exit 0
     fi
 
-    hdr "shared resources"
-    $PER_VM_KEY || ensure_key "$KEY_PATH"
-    $DOCKERD && ensure_dockerd_keys
-    CONFIG_ID="$(ensure_config_provider)"
-    # Read once here rather than per VM: prune_shadowing_env runs for every
-    # box and each call would otherwise be another round trip.
-    DYNAMIC_SECRETS=()
-    while read -r n; do [ -n "$n" ] && DYNAMIC_SECRETS+=("$n"); done \
-      < <(dynamic_secret_names "$(cp_read "$CONFIG_ID")")
-    [ "${#DYNAMIC_SECRETS[@]}" -gt 0 ] \
-      && say "extra shared secrets: ${DYNAMIC_SECRETS[*]}"
-    CELLAR_ID="$(ensure_shared_addon cellar-addon "$CELLAR_ADDON" S)"
-    # Cellar bucket names are globally unique across the whole provider, so
-    # a friendly name like "vm-agent-files" collides with other tenants and
-    # survives a teardown as an unreachable 409/403. Deriving it from the
-    # add-on's own id makes it unique, and makes a recreated add-on get a
-    # fresh bucket rather than inherit a name it cannot open.
-    if [ -z "$CELLAR_BUCKET_NAME" ]; then
-      cellar_real="$(addon_real_id_by_name "$CELLAR_ADDON")"
-      CELLAR_BUCKET_NAME="vm-agent-$(printf '%s' "${cellar_real#cellar_}" | tr -d - | cut -c1-12)"
-      [ "$CELLAR_BUCKET_NAME" = "vm-agent-" ] && die "could not derive a Cellar bucket name"
-    fi
-    FS_ID="$(ensure_shared_addon fs-bucket "$FS_ADDON" s)"
-    FS_BUCKET_HOST="$(clever addon env "$FS_ID" --format json 2>/dev/null | jq -r '.BUCKET_HOST // ""')"
-    [ -n "$FS_BUCKET_HOST" ] || die "could not read BUCKET_HOST for $FS_ADDON"
-    touch "$FLEET_FILE"
-    FLEET_ROSTER="$(build_fleet_roster)"
-    VM_AGENT_FLEET_TOKEN="$(ensure_fleet_token "$(cp_read "$CONFIG_ID" \
-      | jq -r '.[]? | select(.name=="VM_AGENT_FLEET_TOKEN") | .value' | head -1)")"
-    export VM_AGENT_FLEET_TOKEN
-    sync_shared_config "$CONFIG_ID"
-    write_local_fleet_env
+    prepare_shared true
 
     for n in ${TARGETS[@]+"${TARGETS[@]}"}; do provision_one "$n" "$CONFIG_ID"; done
 
@@ -1149,7 +1248,7 @@ case "$ACTION" in
     ;;
 esac
 
-if [ "$ACTION" = "provision" ] || [ "$ACTION" = "all" ]; then
+if [ "$ACTION" = "provision" ] || [ "$ACTION" = "all" ] || [ "$ACTION" = "shared" ]; then
   hdr "commit key to register on your forges"
   cat "${KEY_PATH}.pub"
   printf '\n  GitHub: https://github.com/settings/keys\n'

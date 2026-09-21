@@ -32,6 +32,11 @@ defaults to your current answer — so re-running it is also how you
 reconfigure a fleet. The rest of this README is what it does for you, and
 what to reach for once the fleet exists.
 
+That builds the VM half. The fleet can also drive a Clever Cloud
+Kubernetes cluster and spawn agents into it as pods — a better shape for
+work that fans out and is thrown away — which `./cluster.sh` sets up; see
+[Agents in Kubernetes](#agents-in-kubernetes).
+
 Naming the fleet matters if you want more than one: the three shared
 add-ons are looked up by name, so `acme` gives you `acme-config`,
 `acme-cellar` and `acme-fs`, separate from any other fleet in the same
@@ -139,7 +144,15 @@ variable of the same name overrides it, so a one-off
 Options: `--flavor`, `--region`, `--config <addon-name>`,
 `--cellar <addon-name>`, `--key <path>`, `--per-vm-key`, `--no-deploy`,
 `--no-roster`, `--forget <VAR>`, `--dockerd` / `--dockerd-flavor` (see
-[Docker and Testcontainers](#docker-and-testcontainers)).
+[Docker and Testcontainers](#docker-and-testcontainers)), and
+`--shared-only`.
+
+`--shared-only` stops after the shared half: the Configuration provider,
+the Cellar bucket, the commit key and the fleet token, with no VM created
+and no FS Bucket either — only a VM mounts one of those. It exists because
+the Kubernetes side needs the fleet's secrets and nothing else, so a fleet
+whose agents are all pods should not have to create a box to get them. See
+[Agents in Kubernetes](#agents-in-kubernetes).
 
 Tokens come from `.secrets/tokens.env` (gitignored) or the surrounding
 environment. **An empty local token never blanks one already in the
@@ -202,6 +215,11 @@ Cellar bucket, the FS Bucket and the config provider running and billing.
 `--purge` takes them too, along with everything the agents stored on them.
 It only works with `--destroy --all`, since no single VM may delete
 storage its neighbours are using.
+
+**`--purge` does not take the Kubernetes cluster.** It is not an add-on
+`provision.sh` knows about, and a control plane is the most expensive
+thing this repository can leave running — `./cluster.sh destroy --yes` is
+the only thing that removes it.
 
 Removing a secret needs `--forget`, because an empty local value means
 "keep whatever the provider has" rather than "delete it":
@@ -272,6 +290,35 @@ key, Home/End, an Alt+key combo, or vim leaving insert mode — all of which
 start with ESC over SSH. Left alone it makes exactly those keys feel
 laggy while plain letters do not, which reads as "some keystrokes are
 delayed" rather than a general slowdown.
+
+### The cluster demo
+
+`demo-k8s.sh` is the same idea for the other half — and the two are worth
+running side by side, because the contrast is the whole argument for having
+both:
+
+```bash
+./demo-k8s.sh start [name]   # start the demo pod, then open the layout
+./demo-k8s.sh fanout [n]     # dispatch n one-shot Jobs (default 3)
+./demo-k8s.sh layout [name]  # just open the layout
+./demo-k8s.sh stop [name]    # delete the pod and the fan-out jobs
+```
+
+Three panes: control on the left, a live `swarm ls` top right, and the
+pod's own herdr UI below it. Run `./demo-k8s.sh fanout 5` from the control
+pane and watch five agents appear in the top pane, answer, and delete
+themselves — next to one pod that stays because you told it to.
+
+It **requires a cluster and an image to exist already** and creates
+neither: `./cluster.sh create` is a billing decision, not a demo step. It
+refuses with the command to run if either is missing.
+
+Unlike `demo.sh` it has nothing to restore on `stop`. `demo.sh` sets the
+permission mode fleet-wide through the config provider and puts it back
+afterwards; here it is a per-pod `--env` override, which beats the
+namespace's secret for those pods only and leaves every other agent in the
+cluster alone. `stop` does not touch the cluster either — that is
+`./cluster.sh destroy --yes`, and it says so.
 
 ## Fleet federation
 
@@ -445,7 +492,8 @@ except the FS Bucket, so this is re-run each time — it takes ~60s):
 a ranked, deterministic repo map (call graph, churn, test coverage) for
 agents, a better first move than grepping cold — [`specify`][speckit] —
 spec-driven development, for a feature worth planning rather than
-improvising — plus the `cellar` and `vm-snapshot` helpers.
+improvising — plus the `cellar`, `vm-snapshot` and `swarm` helpers. `kubectl` too, once
+the fleet has a cluster — see [Agents in Kubernetes](#agents-in-kubernetes).
 
 [ripwire]: https://github.com/redhat-et/ripwire
 [speckit]: https://github.com/github/spec-kit
@@ -540,6 +588,300 @@ the fleet. `--destroy <vm>` takes the companion with it.
 The companion holds no state — it is rebuilt from `dockerd/Dockerfile` on every
 deploy — and prunes what Testcontainers leaks (by its `org.testcontainers`
 label, so the instance's own image cache is left alone).
+
+## Agents in Kubernetes
+
+Clever Cloud has a managed Kubernetes offer, and it is a better fit for a
+kind of work the VM fleet is bad at. A VM is a pet: two minutes to boot
+while it installs its toolchain, a workspace on an NFS bucket, a herdr
+session worth reattaching to tomorrow. A pod is the opposite — seconds to
+start from a prebuilt image, nothing on its filesystem meant to survive,
+and no reason to look at it again once it has answered. Fanning ten agents
+out across a repository is painful with the first shape and trivial with
+the second.
+
+Both halves share everything that matters: the same agents, the same
+credentials out of the same Configuration provider, and the same `:8080`
+API — so `swarm` is `fleet` with a different transport, not a second
+system to learn.
+
+```bash
+./provision.sh --shared-only       # the shared add-ons and config - no VM
+./cluster.sh create                # the cluster, and .secrets/kubeconfig.yaml
+./cluster.sh image                 # build the agent image, push it to GitLab
+swarm run review "review src/auth for injection bugs" --repo git@… --wait
+```
+
+The first line is the only dependency on the rest of this repository, and
+it creates no VM. A pod reads the fleet's secrets — the agent tokens, the
+commit key, the fleet token — from the shared Configuration provider, so
+that add-on has to exist; it is free, and `--shared-only` creates it, the
+Cellar bucket and nothing else. **A fleet whose agents are all pods never
+creates a box.**
+
+There is no fourth step. `swarm` reads the cluster out of
+`.secrets/kubeconfig.yaml` and `.secrets/k8s.env`, both written by
+`cluster.sh`, so a pod-only fleet is ready at that point. Publishing the
+kubeconfig to the shared configuration — `./provision.sh --all
+--no-deploy` — is how a **VM** learns to drive the cluster, and is worth
+running only once you have one. On an empty roster `--all` has nothing to
+apply to and says so.
+
+`cluster.sh` is idempotent the way `provision.sh` is: every step checks the
+state it wants before touching anything. `./cluster.sh doctor` walks the
+whole path and says which link is missing.
+
+### Two shapes of agent
+
+```bash
+swarm run <name> "prompt" [--repo <url>] [--wait]   # a Job: answer, then vanish
+swarm start <name> [kind] [--repo <url>]            # a Pod: herdr inside, driveable
+```
+
+**`swarm run` is the one to reach for.** It is a Kubernetes Job running the
+agent headless — `claude -p`, `codex exec`, `opencode run` — with the
+prompt in its environment and the answer on stdout. Ten of them in
+parallel cost nothing to set up, which is the entire point of doing this
+in a cluster rather than on boxes.
+
+Its log stays quiet while it runs. `claude -p` buffers, so `swarm logs -f`
+on a job shows the boot sequence and then nothing until the answer arrives
+in one piece — that is the agent thinking, not a stall. `swarm read` is
+the live view, and only `swarm start` pods have a pane for it.
+
+A finished job **does not disappear immediately, and should not**: its log
+is where the answer lives until something collects it, so the pod is kept
+`Succeeded` for an hour (`ttlSecondsAfterFinished`, `--ttl` to change it)
+and then deleted by Kubernetes. A `Succeeded` pod holds no CPU or memory —
+it is a record, not a workload. `swarm kill <name>` removes one now,
+`swarm reap` removes every finished one, and `--ttl 0` means "delete the
+moment it finishes", which only makes sense with `--wait` or the answer
+goes with it.
+
+Headless mode also sidesteps the problem that shaped `fleet task`: a
+pane agent's UI collapses tool output, so the terminal is not a transport
+for results. `claude -p` writes its answer to stdout, where nothing folds
+it away.
+
+**`swarm start`** is the other shape, for when you need to correct an agent
+mid-task. It creates a long-lived pod running herdr and the status server,
+launches one agent named `main` in it, and then takes the verbs `fleet`
+already uses:
+
+```bash
+swarm prompt build "also update the changelog"
+swarm read build -f
+swarm abort build --tell "stop, that was the wrong module"
+swarm task build "…"   &&   swarm fetch build
+swarm attach build     # herdr's own UI, straight over kubectl exec
+```
+
+`<name>` on its own means `<name>/main`; `<name>/<agent>` addresses any
+other agent in the pod. Nothing reaps these — `swarm kill <name>` does.
+
+Both take `--env NAME=VALUE`, repeatable, for a one-off override of
+something the namespace's secret provides: `env` beats `envFrom` in a pod
+spec, so this changes one pod without rewriting the secret that every
+other agent in the cluster reads. `demo-k8s.sh` uses it to run its pods
+with `bypassPermissions` while the rest of the fleet keeps whatever
+`fleet.conf` says.
+
+### Why the transport is `kubectl exec`
+
+A VM publishes an HTTPS endpoint the platform routes to, which is what
+`fleet` talks to. A pod publishes nothing: exposing every agent through an
+Ingress would mean a public URL per pod, a certificate per pod, and a
+second authentication story, for a workload whose median lifetime is a few
+minutes.
+
+So `swarm` runs the same HTTP call the fleet makes, but from *inside* the
+pod, over the exec channel that kubectl already authenticates. The pleasant
+side effect is that the fleet token never leaves the cluster: the `curl`
+carrying it is expanded by a shell in the container, from the environment
+the namespace's secret already gave it, so it is in no argument list, no
+shell history and no audit log on your side.
+
+It also makes `swarm attach` simpler than its VM counterpart — no ssh
+gateway to work around, no tmux wrapper, just `kubectl exec -it … herdr`.
+
+### The image
+
+`k8s/Dockerfile` bakes what a VM installs at boot: herdr, claude, opencode,
+codex, gh, glab, ripwire, plus `cellar` and `fleet`. It also copies
+`scripts/` in and runs `10-secrets.sh` and `15-agent-auth.sh` **verbatim**
+at startup — a pod that authenticated from its own second copy of that
+logic would be a pod that stops matching the fleet the first time a token
+rotates.
+
+It is built on your machine and pushed to a gitlab.com project's container
+registry:
+
+```bash
+./cluster.sh image                              # <your user>/vm-agent-images
+./cluster.sh image --project acme/agents --tag v2
+./cluster.sh image --no-push                    # build only
+```
+
+### Somewhere other than GitLab
+
+The default reference is composed GitLab's way —
+`<registry>/<project>/<name>` — and each piece has a flag: `--registry`,
+`--project`, `--image-name`, `--tag`. That shape does not fit every
+registry, so `--image` takes the whole repository verbatim, tag optional:
+
+```bash
+./cluster.sh image --image ghcr.io/you/vm-agent:v3
+./cluster.sh image --image docker.io/you/vm-agent
+./cluster.sh image --image localhost:5000/vm-agent --tag dev
+```
+
+A first segment with a dot or a colon is read as a registry host, so
+`localhost:5000/vm-agent` is a host and a port rather than a repository
+and a tag, and a bare `you/vm-agent` means Docker Hub.
+
+**Outside GitLab, nothing is created for you.** Project creation and the
+`read_registry` deploy token are GitLab API calls; against ghcr.io or
+Docker Hub they are skipped rather than attempted. So the repository has
+to exist already, the push relies on a `docker login` you have done
+yourself (or `K8S_REGISTRY_USER`/`K8S_REGISTRY_TOKEN`), and those same two
+variables are what the cluster pulls with. Without them no pull secret is
+written, and the image has to be public or the secret already in place —
+`cluster.sh` says so rather than leaving you to find out from an
+`ImagePullBackOff`.
+
+Unlike `dockerd/Dockerfile`, this one does **not** have to be committed
+first: the companion daemon is deployed from git by the platform, while
+this image is built from your working tree by your own Docker and pushed
+as a finished artefact. What the cluster runs is the tag you pushed, so
+`--tag` is the version control here.
+
+The push credential is checked **before** the build, not after it: the
+build is minutes and the check is one request, so finding out at the end
+that nothing can be pushed wastes all of them. It takes `GITLAB_TOKEN` if
+set, otherwise the token `glab` already holds.
+
+One trap worth knowing: the token `glab auth login` stores after a
+*browser* login is an OAuth token, and the container registry does not
+generally accept one — so being logged in to `glab` is not enough by
+itself, even though it is enough to create the project. A personal access
+token with `write_registry` is the reliable answer, and the error says so
+if the registry refuses.
+
+The project is created on confirmation if it does not exist. Two different
+credentials are used on purpose: **your** token pushes (it needs
+`write_registry`, and it never leaves your machine), while the cluster
+pulls with a **project deploy token scoped to `read_registry`**, created
+once and kept in `.secrets/registry.env`. Anything able to read a secret in
+the namespace can read that pull credential — a personal access token there
+would hand the same reader your whole GitLab account.
+
+### Unattended means `bypassPermissions`
+
+A pod agent has nobody at the keyboard, and a `swarm run` job has no pane
+at all — there is no `swarm keys` to answer with, because there is no
+terminal to answer into. `acceptEdits`, the fleet default, auto-approves
+file edits and **re-asks for everything else**: a web search, a novel
+shell command. Headless, that prompt cannot be answered, so the run
+completes and the answer is the agent asking for approval:
+
+> It looks like WebSearch permission wasn't granted — could you approve it?
+
+which reads like a bad reply rather than a misconfiguration. `swarm run`
+warns at dispatch when the cluster's mode is not `bypassPermissions`, and
+so does `./cluster.sh secrets` when it publishes one.
+
+It is a real decision, not a formality — the pods carry a push-capable
+commit key and your forge tokens, exactly as the VMs do. Set it
+deliberately in `fleet.conf`:
+
+```bash
+: "${CLAUDE_PERMISSION_MODE:=bypassPermissions}"
+```
+
+then `./provision.sh --shared-only && ./cluster.sh secrets`. For one run
+only, `swarm run … --env CLAUDE_PERMISSION_MODE=bypassPermissions`.
+
+### What a pod does not have
+
+* **No bucket.** `~/workspace` and `~/out` are container filesystem, and
+  they go when the pod goes. Results leave through git or through `~/out/`,
+  which is copied to Cellar under `k8s/<name>/` on shutdown and every two
+  minutes in between. `swarm fetch` reads the live pod first, then the
+  Job's log, then Cellar — in the order those stop being true.
+* **No `~/shared`, no neighbouring VM's workspace.** `--repo <url>` is how
+  a pod gets a repository; `--ref` picks a branch.
+* **No Docker daemon**, so no Testcontainers. That is what `--dockerd` and
+  a VM are for.
+* **No cluster credentials.** `cluster.sh secrets` deliberately drops
+  `VM_AGENT_KUBECONFIG_B64` when it builds the namespace's secret, so a pod
+  agent cannot spawn pods. A fleet that can fork itself by accident is not
+  a feature.
+* **No persistent workspace unless you ask.** `swarm start --pvc 20Gi`
+  attaches one (after `./cluster.sh storage` enables Ceph CSI), for the
+  case that actually justifies it: a cold cargo or npm cache on a long
+  build. The claim deliberately outlives `swarm kill`.
+
+### Who can create a cluster
+
+The VMs cannot, by design. They get the kubeconfig — enough to start, drive
+and kill agent pods — but `clever k8s create` and `delete` need Clever API
+credentials, and putting those in the shared Configuration provider would
+hand infrastructure creation, with billing attached, to every agent running
+with `bypassPermissions`. Cluster lifecycle stays on your machine, in
+`cluster.sh`.
+
+The same reasoning is why `cluster.sh` never writes to the shared
+configuration itself. Publishing the kubeconfig restarts every linked VM
+and destroys the panes of whatever the agents were doing, and the check for
+who is mid-task lives in `provision.sh` — so `cluster.sh` leaves the
+kubeconfig in `.secrets/` and the settings in `fleet.conf`, and
+`./provision.sh --all --no-deploy` publishes them when the fleet is quiet.
+
+### The cluster needs nodes, and does not get them by default
+
+`clever k8s create` builds a **control plane and nothing else**. The
+cluster then reports `ACTIVE`, answers `kubectl`, and accepts a pod —
+which stays `Pending` for ever, because there is nowhere to run it. On
+clever-tools 4.5 there is no flag to say otherwise; node groups only
+became a subcommand in 4.9.
+
+So `cluster.sh create` adds one, and `./cluster.sh nodes` is the way to
+add or inspect one on a cluster that has none:
+
+```bash
+./cluster.sh nodes                 # list; create the default if there is none
+./cluster.sh nodes --nodes L:3     # a bigger pool
+```
+
+It goes through the same `/v4/kubernetes` API the CLI uses, so it works
+whatever clever-tools you have — the same reason the shared configuration
+is written with `clever curl`. `K8S_NODES` in `fleet.conf` is the lasting
+default, as `<flavor>:<count>` over `2XS XS S M L XL`. **Nodes are billed
+separately from the control plane**, so an existing node group is never
+resized by a re-run; change it deliberately, with `clever k8s nodegroups`
+on a recent clever-tools or from the Console.
+
+`./cluster.sh doctor` checks both that a node group exists and that a node
+has actually registered — they are minutes apart, and a pod scheduled in
+between waits without saying why.
+
+### `clever k8s` is in beta
+
+The cluster commands are behind an experimental flag (`clever features
+enable k8s`, which `cluster.sh` does for you) and the options have moved
+between releases: node groups, autoscaling, control-plane flavors and
+version pinning arrived in clever-tools 4.9, while 4.5 creates a cluster
+with a single default node group and no knobs at all. `cluster.sh` uses
+only the calls that exist in both, so it works on either — but sizing the
+cluster is `clever k8s nodegroups` on a recent clever-tools, not something
+this repository wraps.
+
+```bash
+clever k8s list
+clever k8s get vm-agent-k8s
+./cluster.sh status               # cluster, nodes, and what is running on it
+./cluster.sh destroy --yes        # the cluster; the GitLab images are kept
+```
 
 ## Storage model
 
@@ -637,14 +979,20 @@ scripts/20-toolchain.sh    installs the agents, herdr, gh, glab
 scripts/30-shell.sh        makes `clever ssh` sessions match the boot env
 scripts/40-herdr.sh        starts the headless herdr server
 scripts/45-dockerd.sh      credentials + tunnel for the companion daemon
+scripts/50-kube.sh         kubectl + kubeconfig, if the fleet has a cluster
 dockerd/Dockerfile         the companion daemon app (docker runtime)
 dockerd/entrypoint.sh      its sshd, health endpoint and janitor
+k8s/Dockerfile             the agent image, built from scripts/ and tools/
+k8s/entrypoint.sh          pod boot: job mode (one answer) or pod mode (herdr)
 tools/cellar               s3cmd wrapper for the Cellar bucket
 tools/vm-snapshot          agent state -> FS Bucket
 tools/fleet                talk to the other VMs (runs on VM and laptop)
+tools/swarm                spawn and drive agents in the cluster (VM or laptop)
 .agents/skills/vm-agent/   SKILL.md: how another agent drives this fleet
 new-fleet.sh               interactive first-run wizard (runs locally)
 provision.sh               idempotent fleet provisioner (runs locally)
+cluster.sh                 the Kubernetes side: cluster, image, namespace (locally)
+demo-k8s.sh                three-pane demo of the pod side (runs locally)
 agent-tokens.sh            fills .secrets/tokens.env (runs locally)
 fleet.conf.example         template for fleet.conf (gitignored)
 connect.sh                 local helper: ssh / herdr attach
@@ -668,6 +1016,10 @@ curl https://app-<id>.cleverapps.io/status
 curl https://app-<id>.cleverapps.io/logs
 clever logs --alias <vm-name>
 ```
+
+For the cluster side, `./cluster.sh doctor` walks the whole path — feature
+flag, cluster, kubeconfig, namespace, both secrets, image — and stops at
+the first link that is missing.
 
 Inside the box, `vm-status` and `vm-log` are aliases for the same thing.
 The boot script never aborts on a failed step: a half-provisioned instance

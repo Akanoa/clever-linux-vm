@@ -25,7 +25,7 @@ BOOT_LOG = os.environ.get("BOOT_LOG", "/tmp/vm-agent-boot.log")
 VM_NAME = os.environ.get("VM_AGENT_NAME", "vm-agent")
 FLEET_TOKEN = os.environ.get("VM_AGENT_FLEET_TOKEN", "")
 TOOLS = ["herdr", "claude", "opencode", "codex", "gh", "glab", "git", "s3cmd",
-         "moerae", "fleet", "cellar"]
+         "moerae", "fleet", "cellar", "swarm", "kubectl"]
 MAX_BODY = 64 * 1024
 MAX_OUT = 8 * 1024 * 1024
 OUT_DIR = os.path.expanduser("~/out")
@@ -398,7 +398,11 @@ class Handler(BaseHTTPRequestHandler):
             if kind not in AGENT_KINDS:
                 return self._json(400, {"error": f"unsupported kind: {kind}",
                                         "supported": sorted(AGENT_KINDS)})
-            cwd = body.get("cwd") or os.path.join(HOME, "workspace")
+            # VM_AGENT_DEFAULT_CWD is how a pod says "the agent belongs in
+            # the repository I cloned", which a VM never needs to say - its
+            # workspace is the bucket and the caller knows what is in it.
+            cwd = (body.get("cwd") or os.environ.get("VM_AGENT_DEFAULT_CWD")
+                   or os.path.join(HOME, "workspace"))
             if not isinstance(cwd, str) or not os.path.isdir(cwd):
                 return self._json(400, {"error": f"cwd is not a directory: {cwd}"})
             label = body.get("label") or name

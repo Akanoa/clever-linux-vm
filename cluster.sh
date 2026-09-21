@@ -1,0 +1,1127 @@
+#!/usr/bin/env bash
+# Build the fleet's Kubernetes side: the cluster, the agent image, and the
+# namespace the pods are spawned into.
+#
+# provision.sh builds pets - VMs that boot for a minute, keep a workspace
+# on a bucket and are worth reattaching to tomorrow. This builds the other
+# half: a cluster where an agent starts in seconds from a prebuilt image,
+# is told one thing, and is thrown away. `swarm` is what drives it
+# afterwards, on a VM or here.
+#
+#   ./cluster.sh create              create the cluster and wire it up
+#   ./cluster.sh image               build the agent image, push it to GitLab
+#   ./cluster.sh bootstrap           namespace, pull secret, agent secrets
+#   ./cluster.sh secrets             refresh the agent secrets only
+#   ./cluster.sh status              cluster, nodes, and what is running
+#   ./cluster.sh kubeconfig          (re)fetch it into .secrets/kubeconfig.yaml
+#   ./cluster.sh nodes               list node groups, adding one if there is none
+#   ./cluster.sh storage             enable persistent volumes (Ceph CSI)
+#   ./cluster.sh doctor              check the whole path end to end
+#   ./cluster.sh destroy --yes       delete the cluster
+#
+# Everything is idempotent, like provision.sh: each step checks the state
+# it wants before touching anything, so re-running is a no-op and
+# re-running after a failure resumes.
+#
+# The one prerequisite is the fleet's shared Configuration provider, which
+# is where a pod's credentials come from. That is an add-on, not a VM:
+# `./provision.sh --shared-only` creates it and creates no box, so a fleet
+# whose agents are all pods never needs one.
+#
+# Options
+#   --org <id|name>   organisation to build in (default: fleet.conf, else
+#                     your personal space)
+#   --cluster <name>  cluster name (default: <FLEET_NAME>-k8s)
+#   --namespace <ns>  namespace for the agents (default: vm-agent)
+#   --nodes <flavor:count>  size of the node group created with the
+#                     cluster (default M:1). Nodes are billed separately
+#                     from the control plane, and an existing node group
+#                     is never resized by a re-run.
+#   --project <path>  gitlab.com project whose registry holds the image
+#   --registry <host> registry host (default: registry.gitlab.com, or
+#                     registry.<GITLAB_HOST> for a self-managed instance)
+#   --image-name <n>  last segment of the repository (default: agent)
+#   --image <ref>     the whole repository, verbatim, tag optional. This is
+#                     how you point at a registry that does not nest the
+#                     way GitLab does - ghcr.io/you/vm-agent,
+#                     docker.io/you/vm-agent, localhost:5000/vm-agent.
+#                     Outside GitLab nothing can be created for you, so
+#                     the project must exist and K8S_REGISTRY_USER /
+#                     K8S_REGISTRY_TOKEN in .secrets/registry.env are what
+#                     the cluster pulls with.
+#   --tag <tag>       image tag (default: latest)
+#   --no-push         image: build only, do not push
+#   --no-wait         create: return as soon as the cluster is accepted
+#   --yes, -y         do not ask before creating or destroying anything
+#
+# This script does NOT write to the fleet's shared configuration. Adding
+# the kubeconfig to it restarts every linked VM and kills the panes of
+# whatever the agents were doing, and provision.sh is the one place that
+# knows how to check for that first. So the handover is:
+#
+#   ./cluster.sh create              # cluster + .secrets/kubeconfig.yaml
+#   ./provision.sh --all --no-deploy # publish it to the fleet, when quiet
+#
+# After which every VM has kubectl, a kubeconfig and `swarm`. That second
+# line is only for fleets that *have* VMs: `swarm` reads the cluster from
+# .secrets/k8s.env here, so a pod-only fleet is already done after the
+# first one, and `--all` would only tell you the roster is empty.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SECRETS_DIR="$ROOT/.secrets"
+KUBECONFIG_PATH="$SECRETS_DIR/kubeconfig.yaml"
+REGISTRY_ENV="$SECRETS_DIR/registry.env"
+
+[ -f "$ROOT/fleet.conf" ] && . "$ROOT/fleet.conf"
+[ -f "$SECRETS_DIR/tokens.env" ] && . "$SECRETS_DIR/tokens.env"
+[ -f "$REGISTRY_ENV" ] && . "$REGISTRY_ENV"
+
+FLEET_NAME="${FLEET_NAME:-vm-agent}"
+CLUSTER="${K8S_CLUSTER:-$FLEET_NAME-k8s}"
+NAMESPACE="${K8S_NAMESPACE:-vm-agent}"
+CONFIG_ADDON="${CONFIG_ADDON:-vm-agent-config}"
+CELLAR_ADDON="${CELLAR_ADDON:-vm-agent-cellar}"
+CELLAR_BUCKET_NAME="${CELLAR_BUCKET_NAME:-}"
+GITLAB_HOST_VALUE="${GITLAB_HOST:-gitlab.com}"
+IMAGE_PROJECT="${K8S_IMAGE_PROJECT:-}"
+IMAGE_NAME="${K8S_IMAGE_NAME:-agent}"
+IMAGE_TAG="${K8S_IMAGE_TAG:-latest}"
+# The whole repository, registry host included and tag excluded. Set, it is
+# used verbatim and the three parts above are ignored - which is the only
+# way to express a registry that does not nest the way GitLab's does:
+# ghcr.io/owner/name, docker.io/user/name, an ECR or Harbor path. Unset,
+# the reference is composed as <registry>/<project>/<name>.
+IMAGE_REPOSITORY="${K8S_IMAGE_REPOSITORY:-}"
+# gitlab.com's registry is on its own host; a self-managed instance
+# usually puts it on registry.<host>, but not always - hence the override.
+if [ "$GITLAB_HOST_VALUE" = gitlab.com ]; then
+  REGISTRY="${K8S_REGISTRY:-registry.gitlab.com}"
+else
+  REGISTRY="${K8S_REGISTRY:-registry.$GITLAB_HOST_VALUE}"
+fi
+NODEGROUP="${K8S_NODEGROUP:-agents}"
+# <flavor>:<count>. A cluster is billed for its control plane *and* its
+# nodes, so this is the one default in the file that costs money by
+# existing - it is deliberately one small node rather than a pool.
+NODES="${K8S_NODES:-M:1}"
+PULL_SECRET="${K8S_PULL_SECRET:-gitlab-registry}"
+SECRET_NAME="${K8S_SECRET:-vm-agent-env}"
+CLEVER_ORG="${CLEVER_ORG:-}"
+ORG_ARGS=()
+PUSH=true; WAIT=true; CONFIRMED=false
+
+c_ok=$'\033[32m'; c_skip=$'\033[2m'; c_do=$'\033[36m'; c_err=$'\033[31m'; c_off=$'\033[0m'
+say()  { printf '%s%s%s\n' "$c_do"   "  → $*" "$c_off"; }
+ok()   { printf '%s%s%s\n' "$c_ok"   "  ✓ $*" "$c_off"; }
+skip() { printf '%s%s%s\n' "$c_skip" "  · $*" "$c_off"; }
+warn() { printf '%s%s%s\n' "$c_err"  "  ! $*" "$c_off" >&2; }
+die()  { printf '%s%s%s\n' "$c_err"  "  ✗ $*" "$c_off" >&2; exit 1; }
+hdr()  { printf '\n\033[1m%s\033[0m\n' "$*"; }
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed"; }
+
+confirm() {  # $1 question
+  $CONFIRMED && return 0
+  [ -t 0 ] || die "$1 - re-run with --yes (nothing to ask on a non-terminal)"
+  printf '%s  %s [y/N] ' "$c_do" "$1"; printf '%s' "$c_off"
+  local a; read -r a
+  case "$a" in y|Y|yes|YES) return 0 ;; *) die "cancelled" ;; esac
+}
+
+# jq 1.6 exits 0 on empty input - the filter never runs, so there is no
+# failed output to report - which turns every `jq -e` guard into "yes"
+# whenever the command feeding it produced nothing at all.
+json_has() {  # $1.. jq args (filter last); JSON on stdin
+  local doc; doc="$(cat)"
+  [ -n "$doc" ] || return 1
+  printf '%s' "$doc" | jq -e "$@" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------- kubectl
+# Installed into the repository's own .secrets/bin rather than anywhere on
+# your PATH: this script should not decide what lands in ~/.local/bin on a
+# machine it does not own. The VMs get theirs from scripts/50-kube.sh.
+ensure_kubectl() {
+  command -v kubectl >/dev/null 2>&1 && return 0
+  local bin="$SECRETS_DIR/bin"
+  if [ -x "$bin/kubectl" ]; then PATH="$bin:$PATH"; return 0; fi
+  say "installing kubectl into .secrets/bin (nothing outside this repository)"
+  mkdir -p "$bin"
+  local ver; ver="$(curl -fsSL --max-time 30 https://dl.k8s.io/release/stable.txt 2>/dev/null)"
+  [ -n "$ver" ] || die "could not resolve the current kubectl version"
+  curl -fsSL --max-time 180 -o "$bin/kubectl" \
+    "https://dl.k8s.io/release/$ver/bin/linux/amd64/kubectl" \
+    || die "could not download kubectl $ver"
+  chmod 755 "$bin/kubectl"
+  PATH="$bin:$PATH"
+  ok "kubectl $ver"
+}
+
+# Every kubectl call in this script goes through the fleet's own
+# kubeconfig, never through whatever cluster your shell happens to point
+# at. Creating a namespace on the wrong cluster is a bad way to find out
+# that KUBECONFIG was set.
+kube() {
+  [ -s "$KUBECONFIG_PATH" ] || die "no kubeconfig - run ./cluster.sh kubeconfig"
+  KUBECONFIG="$KUBECONFIG_PATH" kubectl "$@"
+}
+
+# ---------------------------------------------------------------- cluster
+k8s_feature_on() {
+  # clever-tools colours its table, so the value is not where a plain
+  # `awk '{print $NF}'` would find it.
+  clever features 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
+    | grep -qE '^k8s[[:space:]]+beta.*[[:space:]]true[[:space:]]*$'
+}
+
+ensure_feature() {
+  k8s_feature_on && { skip "clever k8s feature enabled"; return 0; }
+  clever features enable k8s >/dev/null 2>&1 \
+    && ok "enabled the experimental 'k8s' feature in clever-tools" \
+    || die "could not enable the k8s feature - 'clever features enable k8s'"
+}
+
+# Whether this fleet has any long-lived boxes. It decides what the "next"
+# hints should say: publishing the kubeconfig and image to the shared
+# configuration is how a *VM* learns to drive the cluster, and a fleet
+# with no VMs has nobody to tell - the local .secrets/k8s.env is already
+# everything `swarm` needs here.
+fleet_has_vms() { [ -s "$ROOT/vms.txt" ]; }
+
+# The command that hands the cluster's coordinates to whatever needs them,
+# or nothing at all when nothing does.
+publish_hint() {
+  if fleet_has_vms; then
+    printf '  %s\n' "./provision.sh --all --no-deploy   $1"
+  else
+    printf '%s\n' "$c_skip  no VMs in this fleet, so there is nothing to publish to -$c_off"
+    printf '%s\n' "$c_skip  swarm reads .secrets/k8s.env directly. Add a VM later and$c_off"
+    printf '%s\n' "$c_skip  ./provision.sh --all --no-deploy gives it the cluster too.$c_off"
+  fi
+}
+
+cluster_json() {
+  clever k8s get "$CLUSTER" ${ORG_ARGS[@]+"${ORG_ARGS[@]}"} --format json 2>/dev/null
+}
+
+cluster_status() { cluster_json | jq -r '.status // ""'; }
+
+# ------------------------------------------------------------- nodes
+# `clever k8s create` builds a control plane and nothing else: on
+# clever-tools 4.5 there is no --nodegroup flag at all, and node groups
+# only arrived as a subcommand in 4.9. A cluster with no node group is
+# ACTIVE, answers kubectl, accepts a pod - and then leaves it Pending for
+# ever, because there is nowhere to run it. That is a bad thing to learn
+# from a hanging demo, so this manages them over the same v4 API the CLI
+# uses, which works on whatever clever-tools you have.
+k8s_api() {  # $1 method, $2 path under the cluster, [$3 JSON body]
+  local owner method="$1" path="$2" body="${3:-}"
+  owner="$(owner_id)" || return 1
+  local url="https://api.clever-cloud.com/v4/kubernetes/organisations/$owner/clusters/$(cluster_id)$path"
+  if [ -n "$body" ]; then
+    clever curl -s -X "$method" "$url" -H "Content-Type: application/json" -d "$body" 2>/dev/null
+  else
+    clever curl -s -X "$method" "$url" 2>/dev/null
+  fi
+}
+
+owner_id() {
+  if [ -n "$CLEVER_ORG" ]; then printf '%s' "$CLEVER_ORG"; return 0; fi
+  clever curl -s https://api.clever-cloud.com/v2/self 2>/dev/null | jq -r '.id // empty'
+}
+
+cluster_id() { cluster_json | jq -r '.id // empty'; }
+
+node_flavors() {
+  clever curl -s https://api.clever-cloud.com/v4/kubernetes-product 2>/dev/null \
+    | jq -r '[.topologies[]?.availableFlavors] | flatten | unique | join(" ")' 2>/dev/null
+}
+
+nodegroups() { k8s_api GET /node-groups; }
+
+# Creates the fleet's node group if the cluster has none at all. It does
+# not touch an existing one: resizing a pool someone sized on purpose is
+# not something a provisioning re-run should decide.
+ensure_nodegroup() {
+  local current flavor count valid
+  current="$(nodegroups)"
+  if printf '%s' "$current" | jq -e 'length > 0' >/dev/null 2>&1; then
+    skip "node groups: $(printf '%s' "$current" | jq -r '[.[] | "\(.name) \(.flavor)x\(.targetNodeCount)"] | join(", ")')"
+    return 0
+  fi
+
+  flavor="${NODES%%:*}"; count="${NODES##*:}"
+  case "$count" in ''|*[!0-9]*) die "K8S_NODES must be <flavor>:<count>, got '$NODES'" ;; esac
+  valid="$(node_flavors)"
+  if [ -n "$valid" ]; then
+    # Accept a lowercase spelling and hand the API the one it wants.
+    local canon; canon="$(printf '%s\n' $valid | grep -ixF -- "$flavor" | head -1)"
+    [ -n "$canon" ] || die "unknown node flavor '$flavor' - pick one of: $valid"
+    flavor="$canon"
+  fi
+
+  confirm "add node group '$NODEGROUP' ($flavor x $count) to '$CLUSTER'? nodes are billed."
+  say "creating node group $NODEGROUP ($flavor x $count)"
+  local out
+  out="$(k8s_api POST /node-groups "$(jq -nc --arg n "$NODEGROUP" --arg f "$flavor" \
+    --argjson c "$count" '{name:$n, flavor:$f, targetNodeCount:$c}')")"
+  if printf '%s' "$out" | jq -e '.id // .name' >/dev/null 2>&1; then
+    ok "node group created - nodes take a few minutes to register"
+  else
+    printf '%s\n' "$out" | head -c 300 >&2; printf '\n' >&2
+    die "could not create the node group"
+  fi
+}
+
+cmd_nodes() {
+  hdr "nodes [$CLUSTER]"
+  local status; status="$(cluster_status)"
+  [ "$status" = ACTIVE ] || die "cluster $CLUSTER is ${status:-missing}, not ACTIVE"
+  ensure_nodegroup
+  local groups; groups="$(nodegroups)"
+  printf '%s' "$groups" | jq -r '.[]? | "  \(.name)  \(.flavor) x \(.targetNodeCount)  \(.status // "?")"'
+  if [ -s "$KUBECONFIG_PATH" ]; then
+    ensure_kubectl
+    hdr "registered with the cluster"
+    kube get nodes 2>/dev/null | sed 's/^/  /' \
+      || skip "no nodes yet - they take a few minutes to join"
+  fi
+}
+
+cmd_create() {
+  hdr "cluster [$CLUSTER]"
+  ensure_feature
+
+  # A pod's credentials come from the fleet's Configuration provider -
+  # there is no second place to get them - so a cluster without one has
+  # nothing to hand an agent. Checked here rather than in bootstrap, three
+  # steps later: a control plane bills from the moment it exists, and
+  # "created, then could not be wired up" is the one failure this script
+  # must not produce.
+  #
+  # What is missing is an *add-on*, not a VM. The cluster needs the
+  # fleet's shared secrets; it has no use for a box, and no way to reach
+  # an FS Bucket. `--shared-only` creates exactly that and nothing else,
+  # so a fleet whose agents are all pods never creates a VM.
+  if [ -z "$(addon_real_id_by_name "$CONFIG_ADDON")" ]; then
+    die "no Configuration provider named $CONFIG_ADDON in this organisation.
+    Pods read the fleet's shared secrets from it - the agent tokens, the
+    commit key, the fleet token - so it has to exist first. It is a free
+    add-on and needs no VM:
+
+      ./agent-tokens.sh claude       store an agent credential
+      ./provision.sh --shared-only   create and publish the shared config
+
+    Then re-run this. Nothing has been created."
+  fi
+
+  local status; status="$(cluster_status)"
+  if [ -n "$status" ]; then
+    skip "cluster exists, status $status"
+  else
+    confirm "create Kubernetes cluster '$CLUSTER'? it is billed while it exists."
+    say "creating cluster $CLUSTER"
+    local out
+    out="$(clever k8s create "$CLUSTER" ${ORG_ARGS[@]+"${ORG_ARGS[@]}"} 2>&1)"
+    status="$(cluster_status)"
+    if [ -z "$status" ]; then
+      printf '%s\n' "$out" | tail -5 >&2
+      die "could not create cluster $CLUSTER"
+    fi
+    ok "cluster created ($(cluster_json | jq -r '.id'))"
+  fi
+
+  if $WAIT; then
+    # A control plane takes minutes. --watch inside clever-tools would do
+    # this too, but it is not on the create path in every release, and a
+    # poll we own reports the same thing in this script's own voice.
+    local waited=0
+    while [ "$status" != ACTIVE ]; do
+      [ "$status" = FAILED ] && die "cluster $CLUSTER failed to deploy - check the Console"
+      [ "$waited" -ge 1800 ] && die "cluster $CLUSTER is still $status after 30 minutes"
+      printf '%s  %s… (%ss)\r' "$c_skip" "$status" "$waited"; printf '%s' "$c_off"
+      sleep 15; waited=$(( waited + 15 ))
+      status="$(cluster_status)"
+    done
+    printf '\033[2K'
+    ok "cluster is ACTIVE"
+  else
+    skip "not waiting (--no-wait) - it is $status; re-run when it is ACTIVE"
+    return 0
+  fi
+
+  # A control plane with no node group cannot run anything, and nothing
+  # else in this script would notice.
+  ensure_nodegroup
+  cmd_kubeconfig
+  cmd_bootstrap
+  hdr "next"
+  printf '  %s\n' "./cluster.sh image                 build and publish the agent image"
+  publish_hint "hand the kubeconfig to the VM fleet"
+  printf '  %s\n' "swarm run hello 'say hi'           (once the image exists)"
+}
+
+cmd_kubeconfig() {
+  hdr "kubeconfig"
+  local status; status="$(cluster_status)"
+  [ -n "$status" ] || die "no cluster named $CLUSTER - run ./cluster.sh create"
+  [ "$status" = ACTIVE ] || die "cluster $CLUSTER is $status, not ACTIVE - the kubeconfig is not ready"
+
+  mkdir -p "$SECRETS_DIR"; chmod 700 "$SECRETS_DIR"
+  local tmp; tmp="$(mktemp)"
+  clever k8s get-kubeconfig "$CLUSTER" ${ORG_ARGS[@]+"${ORG_ARGS[@]}"} > "$tmp" 2>/dev/null
+  # Judge by the content, not the exit status: an error page written to a
+  # file is still a file, and a broken kubeconfig fails much later and much
+  # more confusingly than an empty one.
+  if ! grep -q '^\(apiVersion\|kind\):' "$tmp"; then
+    rm -f "$tmp"
+    die "clever k8s get-kubeconfig did not return a kubeconfig"
+  fi
+  if [ -f "$KUBECONFIG_PATH" ] && cmp -s "$tmp" "$KUBECONFIG_PATH"; then
+    rm -f "$tmp"; skip ".secrets/kubeconfig.yaml already current"
+  else
+    mv "$tmp" "$KUBECONFIG_PATH"; chmod 600 "$KUBECONFIG_PATH"
+    ok "wrote .secrets/kubeconfig.yaml"
+  fi
+
+  ensure_kubectl
+  write_local_k8s_env
+  local server; server="$(kube config view -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null)"
+  if kube version --request-timeout=15s >/dev/null 2>&1; then
+    ok "reachable: $server"
+  else
+    warn "the kubeconfig is written but $server did not answer - a freshly"
+    warn "  ACTIVE cluster can take another minute to accept connections"
+  fi
+}
+
+# --------------------------------------------------------------- registry
+# The image lives in a GitLab project's container registry. Two different
+# credentials, on purpose:
+#
+#   push  your own token (needs write_registry) - used here, on your
+#         machine, and never leaves it.
+#   pull  a project deploy token scoped to read_registry - that is the one
+#         copied into the cluster, where anything that can read a secret
+#         in the namespace can read it. A personal access token there
+#         would hand the same reader your whole GitLab account.
+gitlab_api() { glab api --hostname "$GITLAB_HOST_VALUE" "$@" 2>/dev/null; }
+
+gitlab_user() {
+  gitlab_api /user 2>/dev/null | jq -r '.username // empty'
+}
+
+url_encode_path() { printf '%s' "$1" | sed 's|/|%2F|g'; }
+
+ensure_project() {  # sets IMAGE_PROJECT and PROJECT_ID
+  need glab
+  local user
+  if [ -z "$IMAGE_PROJECT" ]; then
+    user="$(gitlab_user)"
+    [ -n "$user" ] || die "cannot read your GitLab user - is GITLAB_TOKEN set, or 'glab auth login' done?
+    or name the project yourself: ./cluster.sh image --project <group>/<project>"
+    IMAGE_PROJECT="$user/vm-agent-images"
+  fi
+
+  PROJECT_ID="$(gitlab_api "/projects/$(url_encode_path "$IMAGE_PROJECT")" | jq -r '.id // empty')"
+  if [ -n "$PROJECT_ID" ]; then
+    skip "GitLab project $IMAGE_PROJECT ($PROJECT_ID)"
+    return 0
+  fi
+
+  confirm "create private GitLab project '$IMAGE_PROJECT' to hold the image?"
+  local path="${IMAGE_PROJECT##*/}" group="${IMAGE_PROJECT%/*}" out
+  # A project under your own namespace needs no namespace_id; one under a
+  # group does, and the group has to be resolved by path first.
+  if [ "$group" = "$(gitlab_user)" ]; then
+    out="$(glab api --hostname "$GITLAB_HOST_VALUE" --method POST /projects \
+      -f "name=$path" -f "path=$path" -f visibility=private \
+      -f description="Container images for the vm-agent fleet" 2>&1)"
+  else
+    local gid; gid="$(gitlab_api "/groups/$(url_encode_path "$group")" | jq -r '.id // empty')"
+    [ -n "$gid" ] || die "no GitLab group '$group' you can create projects in"
+    out="$(glab api --hostname "$GITLAB_HOST_VALUE" --method POST /projects \
+      -f "name=$path" -f "path=$path" -f "namespace_id=$gid" -f visibility=private \
+      -f description="Container images for the vm-agent fleet" 2>&1)"
+  fi
+  PROJECT_ID="$(printf '%s' "$out" | jq -r '.id // empty' 2>/dev/null)"
+  if [ -z "$PROJECT_ID" ]; then
+    printf '%s\n' "$out" | tail -5 >&2
+    die "could not create $IMAGE_PROJECT"
+  fi
+  ok "created GitLab project $IMAGE_PROJECT ($PROJECT_ID)"
+}
+
+# A read_registry deploy token for the cluster. Kept in .secrets so a
+# second run reuses it: GitLab returns the token exactly once, at creation,
+# and there is no way to read it back afterwards.
+ensure_deploy_token() {
+  if [ -n "${K8S_REGISTRY_USER:-}" ] && [ -n "${K8S_REGISTRY_TOKEN:-}" ]; then
+    skip "registry pull credentials present (.secrets/registry.env)"
+    return 0
+  fi
+  say "creating a read_registry deploy token on $IMAGE_PROJECT"
+  local out user token
+  # -F, not -f. `glab api` builds a JSON body rather than a form, so the
+  # Rails-style `-f "scopes[]=read_registry"` produces a key literally
+  # named "scopes[]" - which GitLab ignores, and then rejects the request
+  # with "scopes is missing" as though the caller had forgotten it. -F
+  # infers the type and the value lands where the API looks for it.
+  out="$(glab api --hostname "$GITLAB_HOST_VALUE" --method POST \
+    "/projects/$PROJECT_ID/deploy_tokens" \
+    -f "name=vm-agent-k8s" -f "username=vm-agent-k8s" \
+    -F "scopes=read_registry" 2>&1)"
+  user="$(printf '%s' "$out" | jq -r '.username // empty' 2>/dev/null)"
+  token="$(printf '%s' "$out" | jq -r '.token // empty' 2>/dev/null)"
+  if [ -z "$token" ]; then
+    printf '%s\n' "$out" | tail -3 >&2
+    # A deploy token is shown exactly once, at creation, so a name that is
+    # already taken cannot be recovered - only replaced.
+    if printf '%s' "$out" | grep -qi 'already been taken\|already exists'; then
+      warn "a deploy token named vm-agent-k8s already exists on $IMAGE_PROJECT,"
+      warn "  and GitLab only ever shows one at creation - so this one cannot be"
+      warn "  read back. Delete it (Settings → Repository → Deploy tokens) and"
+      warn "  re-run, or put the copy you kept into .secrets/registry.env as"
+      warn "  K8S_REGISTRY_USER / K8S_REGISTRY_TOKEN."
+    else
+      warn "could not create a deploy token - falling back to the push credential."
+      warn "  that token can do everything your account can, and the cluster keeps"
+      warn "  it in a namespace secret; prefer a deploy token (Settings → Repository"
+      warn "  → Deploy tokens, scope read_registry) in .secrets/registry.env as"
+      warn "  K8S_REGISTRY_USER / K8S_REGISTRY_TOKEN."
+    fi
+    # The credential that just pushed the image is by definition one that
+    # works against this registry. Insisting on GITLAB_TOKEN here would
+    # refuse the very token the push succeeded with, which is how this
+    # first showed up: "no GITLAB_TOKEN either" on a run that had just
+    # pushed perfectly well using glab's.
+    resolve_push_token
+    K8S_REGISTRY_USER="$(gitlab_user)"
+    K8S_REGISTRY_TOKEN="$PUSH_TOKEN"
+    [ -n "$K8S_REGISTRY_USER" ] && [ -n "$K8S_REGISTRY_TOKEN" ] \
+      || die "no credential left to pull the image with"
+    return 0
+  fi
+  K8S_REGISTRY_USER="$user"; K8S_REGISTRY_TOKEN="$token"
+  mkdir -p "$SECRETS_DIR"; chmod 700 "$SECRETS_DIR"
+  {
+    echo "# Generated by cluster.sh - gitignored, do not commit."
+    echo "# A read_registry deploy token on $IMAGE_PROJECT. GitLab shows a"
+    echo "# deploy token once, at creation; this is the only copy."
+    printf 'export K8S_REGISTRY_USER=%s\n' "\"$user\""
+    printf 'export K8S_REGISTRY_TOKEN=%s\n' "\"$token\""
+  } > "$REGISTRY_ENV"
+  chmod 600 "$REGISTRY_ENV"
+  ok "deploy token created and saved to .secrets/registry.env"
+}
+
+# Docker repository names must be lowercase; GitLab namespaces need not be,
+# and plenty are not - `Akanoa/vm-agent-images` is a perfectly ordinary
+# project path that docker rejects outright ("repository name must be
+# lowercase"). GitLab resolves the lowercased path to the same project's
+# registry, so folding the case here is correct rather than a workaround.
+#
+# Only the path is folded. A tag is case-sensitive to docker, so `:v1.2-RC`
+# has to survive intact - lowercasing the whole reference would quietly
+# push somewhere else.
+image_ref() {
+  local path
+  if [ -n "$IMAGE_REPOSITORY" ]; then
+    path="$IMAGE_REPOSITORY"
+  else
+    path="$(printf '%s/%s/%s' "$REGISTRY" "$IMAGE_PROJECT" "$IMAGE_NAME")"
+  fi
+  printf '%s:%s' "$(printf '%s' "$path" | tr '[:upper:]' '[:lower:]')" "$IMAGE_TAG"
+}
+
+# The registry host of whatever reference we are going to build, which is
+# what decides whether the GitLab-specific steps below apply at all.
+image_registry() {
+  if [ -n "$IMAGE_REPOSITORY" ]; then
+    # A reference with no registry host - "user/name" - is Docker Hub by
+    # convention: the first segment is only a host if it looks like one.
+    local first="${IMAGE_REPOSITORY%%/*}"
+    case "$first" in
+      *.*|*:*|localhost) printf '%s' "$first" ;;
+      *)                 printf 'docker.io' ;;
+    esac
+  else
+    printf '%s' "$REGISTRY"
+  fi
+}
+
+# Creating a project and minting a read_registry deploy token are GitLab
+# API calls. Against ghcr.io or Docker Hub they are meaningless, so they
+# are skipped rather than attempted and reported as failures.
+is_gitlab_registry() {
+  case "$(image_registry)" in
+    registry.gitlab.com|"registry.$GITLAB_HOST_VALUE"|"$GITLAB_HOST_VALUE") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The credential that pushes. GITLAB_TOKEN is the fleet's own answer and
+# wins; failing that, glab's stored login is a perfectly good token that
+# this machine already holds - and it is the one ensure_project just used,
+# so refusing to push with it while happily creating projects with it
+# would be an odd place to draw a line.
+resolve_push_token() {
+  # A non-GitLab registry has no glab to fall back on: the credential is
+  # whatever the caller put in .secrets/registry.env, or a docker login
+  # they already did themselves.
+  if ! is_gitlab_registry; then
+    PUSH_TOKEN="${K8S_REGISTRY_TOKEN:-}"
+    PUSH_SOURCE=".secrets/registry.env"
+    return 0
+  fi
+  PUSH_TOKEN="${GITLAB_TOKEN:-}"
+  PUSH_SOURCE="GITLAB_TOKEN"
+  if [ -z "$PUSH_TOKEN" ] && command -v glab >/dev/null 2>&1; then
+    PUSH_TOKEN="$(glab config get token --host "$GITLAB_HOST_VALUE" 2>/dev/null)"
+    PUSH_SOURCE="glab's stored login for $GITLAB_HOST_VALUE"
+  fi
+  [ -n "$PUSH_TOKEN" ] || die "no GitLab credential to push the image with. Either:
+      ./agent-tokens.sh set GITLAB_TOKEN    (needs the write_registry scope), or
+      glab auth login                       and this will use that token
+    Or build without pushing: ./cluster.sh image --no-push"
+}
+
+# Proving the credential before the build rather than after it. The build
+# is minutes; this is one request, and finding out at the end that nothing
+# can be pushed wastes all of them.
+#
+# A successful login is not proof of write_registry - the registry issues
+# scoped tokens at push time, not at login - so the scope is checked
+# separately, and only as a warning, because a deploy token or a
+# group/CI token has no /personal_access_tokens/self to report.
+verify_push_credential() {
+  local builder="$1" user
+  resolve_push_token
+
+  if ! is_gitlab_registry; then
+    # Nothing here knows how to mint a credential for an arbitrary
+    # registry, and a docker login the caller already performed is a
+    # perfectly good answer - so check what we can and get out of the way.
+    if [ -z "${K8S_REGISTRY_USER:-}" ] || [ -z "$PUSH_TOKEN" ]; then
+      skip "no K8S_REGISTRY_USER/K8S_REGISTRY_TOKEN for $(image_registry) -"
+      skip "  assuming '$builder login $(image_registry)' was already done"
+      return 0
+    fi
+    say "checking the push credential for $(image_registry)"
+    printf '%s' "$PUSH_TOKEN" | "$builder" login "$(image_registry)" \
+      --username "$K8S_REGISTRY_USER" --password-stdin >/dev/null 2>&1 \
+      || die "$(image_registry) rejected K8S_REGISTRY_USER/K8S_REGISTRY_TOKEN"
+    ok "logged in to $(image_registry) as $K8S_REGISTRY_USER"
+    return 0
+  fi
+
+  user="$(gitlab_user)"
+  [ -n "$user" ] || die "cannot read your GitLab user - is the token valid?"
+  say "checking the push credential ($PUSH_SOURCE)"
+  printf '%s' "$PUSH_TOKEN" | "$builder" login "$REGISTRY" \
+    --username "$user" --password-stdin >/dev/null 2>&1 \
+    || die "$REGISTRY rejected the credential from $PUSH_SOURCE.
+    The container registry wants a personal access token with the
+    write_registry scope. Note that the token \`glab auth login\` stores
+    after a browser login is an OAuth token, which the registry does not
+    generally accept - so being logged in to glab is not enough on its own:
+      ./agent-tokens.sh set GITLAB_TOKEN    paste a PAT with write_registry"
+  ok "logged in to $REGISTRY as $user"
+
+  # Informational only, and best effort. Reached only after a successful
+  # login, so it answers "will the push itself be refused" rather than
+  # "can I authenticate" - the registry issues its scoped token at push
+  # time, not at login, so the two are genuinely different questions.
+  local self scopes
+  self="$(gitlab_api /personal_access_tokens/self)"
+  scopes="$(printf '%s' "$self" | jq -r '.scopes[]?' 2>/dev/null | paste -sd" ")"
+  if [ -n "$scopes" ]; then
+    case " $scopes " in
+      *" write_registry "*|*" api "*) skip "token scopes: $scopes" ;;
+      *) warn "token scopes are '$scopes' - neither write_registry nor api is among"
+         warn "  them, so the push will most likely be refused. Continuing anyway." ;;
+    esac
+  elif printf '%s' "$self" | grep -q 'personal access token'; then
+    # A deploy token, a CI job token or an OAuth token. None of them can
+    # report their own scopes, and the first two are legitimate here.
+    skip "not a personal access token, so its scopes cannot be read - pushing anyway"
+  fi
+}
+
+cmd_image() {
+  hdr "agent image"
+  need jq
+  local builder=""
+  for b in docker podman nerdctl; do command -v "$b" >/dev/null && { builder="$b"; break; }; done
+  [ -n "$builder" ] || die "no container builder found (docker, podman or nerdctl)
+    the image can also be built on a VM that has --dockerd; see the README"
+
+  # Everything cheap and fallible, before the expensive and slow part.
+  $PUSH && verify_push_credential "$builder"
+  if is_gitlab_registry; then
+    ensure_project
+  elif [ -z "$IMAGE_REPOSITORY" ]; then
+    die "K8S_REGISTRY is $(image_registry) but no K8S_IMAGE_REPOSITORY is set.
+    Outside GitLab the repository cannot be derived from a project path -
+    give the whole thing:
+      ./cluster.sh image --image ghcr.io/you/vm-agent"
+  else
+    skip "$(image_registry) is not a GitLab registry - using $IMAGE_REPOSITORY as given"
+  fi
+  local ref; ref="$(image_ref)"
+
+  # A broken or missing buildx plugin makes `docker build` print
+  # "failed to fetch metadata: ... exec format error" and a DEPRECATED
+  # banner before falling back to the legacy builder. It is environmental,
+  # it is not fatal, and it lands in the middle of our output where it
+  # reads like our failure - so ask for the legacy builder explicitly,
+  # which drops the first message, and explain the second.
+  local -a build_env=()
+  if [ "$builder" = docker ] && ! docker buildx version >/dev/null 2>&1; then
+    build_env=(DOCKER_BUILDKIT=0)
+    say "docker buildx is unusable here, so this uses the legacy builder"
+    printf '%s\n' "$c_skip    the DEPRECATED notice below is docker's and is harmless;$c_off"
+    printf '%s\n' "$c_skip    to be rid of it, fix or remove ~/.docker/cli-plugins/docker-buildx$c_off"
+  fi
+
+  say "building $ref with $builder (context: the repository root)"
+  env ${build_env[@]+"${build_env[@]}"} \
+    "$builder" build -f "$ROOT/k8s/Dockerfile" -t "$ref" "$ROOT" \
+    || die "image build failed"
+  ok "built $ref"
+
+  if ! $PUSH; then
+    skip "not pushing (--no-push)"
+    return 0
+  fi
+
+  # Already authenticated above, before the build.
+  "$builder" push "$ref" || die "could not push $ref"
+  ok "pushed $ref"
+
+  # The cluster has to be able to pull it, and the fleet has to know what
+  # to spawn. Both are written where they are read from, not announced.
+  if is_gitlab_registry; then
+    ensure_deploy_token
+    record_setting K8S_IMAGE_PROJECT "$IMAGE_PROJECT"
+  else
+    record_setting K8S_IMAGE_REPOSITORY "$IMAGE_REPOSITORY"
+    [ -n "${K8S_REGISTRY_USER:-}" ] && [ -n "${K8S_REGISTRY_TOKEN:-}" ] \
+      || warn "no K8S_REGISTRY_USER/K8S_REGISTRY_TOKEN, so no pull secret can be
+  written. The cluster can only pull this image if it is public, or if a
+  pull secret named $PULL_SECRET already exists in namespace $NAMESPACE."
+  fi
+  record_setting K8S_IMAGE "$ref"
+  K8S_IMAGE="$ref"; write_local_k8s_env
+  if [ -s "$KUBECONFIG_PATH" ]; then
+    ensure_kubectl
+    ensure_pull_secret
+  else
+    skip "no kubeconfig yet - run ./cluster.sh bootstrap once the cluster exists"
+  fi
+  hdr "next"
+  publish_hint "publish K8S_IMAGE to the fleet"
+  if [ -s "$KUBECONFIG_PATH" ]; then
+    printf '  %s\n' "swarm run hello 'reply with the word ok' --wait"
+  else
+    printf '  %s\n' "./cluster.sh create                the cluster to run it on"
+  fi
+}
+
+# So `swarm` works from this machine too, not just from a VM where the
+# shared Configuration provider supplies all of this. Same idea as
+# provision.sh's .secrets/fleet.env, for the same reason.
+write_local_k8s_env() {
+  local f="$SECRETS_DIR/k8s.env" tmp image
+  [ -s "$KUBECONFIG_PATH" ] || return 0
+  # Only `cluster.sh image` knows the image reference; every other caller
+  # rewrites this file without one. Carry the previous value across rather
+  # than dropping it - otherwise `./cluster.sh kubeconfig` silently leaves
+  # swarm with no image and the next run fails asking for --image.
+  # Read back by sourcing rather than by pattern: this file has had two
+  # spellings now (`export VAR=` and `: "${VAR:=}"`), and a regex that
+  # knows about only one of them fails silently and drops the value.
+  image="${K8S_IMAGE:-}"
+  if [ -z "$image" ] && [ -f "$f" ]; then
+    image="$( unset VM_AGENT_K8S_IMAGE; . "$f" >/dev/null 2>&1
+              printf '%s' "${VM_AGENT_K8S_IMAGE:-}" )"
+  fi
+  mkdir -p "$SECRETS_DIR"; chmod 700 "$SECRETS_DIR"
+  tmp="$(mktemp)"
+  {
+    echo "# Generated by cluster.sh - gitignored, do not commit."
+    echo "# Sourced by tools/swarm. Everything here is a *default*: a value"
+    echo "# already set in the environment wins, so a one-off"
+    echo "#   VM_AGENT_K8S_IMAGE=other:tag swarm run ..."
+    echo "# does what it looks like. KUBECONFIG is the one exception - see below."
+    echo ""
+    echo "# Deliberately not a default. swarm must talk to this fleet's cluster"
+    echo "# and no other: 'swarm kill' being able to mean a different cluster"
+    echo "# than 'swarm ls' did a moment ago is not a trade worth making."
+    printf 'export KUBECONFIG=%s\n' "\"$KUBECONFIG_PATH\""
+    echo ""
+    printf ': "${VM_AGENT_K8S_NAMESPACE:=%s}"; export VM_AGENT_K8S_NAMESPACE\n' "$NAMESPACE"
+    [ -n "$image" ] \
+      && printf ': "${VM_AGENT_K8S_IMAGE:=%s}"; export VM_AGENT_K8S_IMAGE\n' "$image"
+    printf ': "${K8S_AGENT_CPU:=%s}"; export K8S_AGENT_CPU\n'       "${K8S_AGENT_CPU:-1}"
+    printf ': "${K8S_AGENT_MEMORY:=%s}"; export K8S_AGENT_MEMORY\n' "${K8S_AGENT_MEMORY:-2Gi}"
+    echo ""
+    echo "# Appended, not prepended: this kubectl is a fallback for a machine"
+    echo "# that has none, not a preference over one already on the PATH."
+    printf 'export PATH=%s\n' "\"\$PATH:$SECRETS_DIR/bin\""
+  } > "$tmp"
+  if [ -f "$f" ] && cmp -s "$tmp" "$f"; then
+    rm -f "$tmp"; skip ".secrets/k8s.env already current"
+  else
+    mv "$tmp" "$f"; chmod 600 "$f"
+    ok "wrote .secrets/k8s.env for the local swarm client"
+  fi
+}
+
+# fleet.conf is where the fleet's non-secret settings live and where
+# provision.sh reads them from, so a value this script derives belongs
+# there rather than in a message telling you to type it in yourself.
+record_setting() {  # $1 var, $2 value
+  local var="$1" value="$2" conf="$ROOT/fleet.conf" line
+  line=": \"\${$var:=$value}\"  # written by cluster.sh"
+  if [ ! -f "$conf" ]; then
+    skip "no fleet.conf - add this yourself: $line"
+    return 0
+  fi
+  if grep -qE "^[[:space:]]*:? *\"?\\\$\\{$var:=" "$conf"; then
+    if grep -qxF "$line" "$conf"; then
+      skip "fleet.conf already has $var"
+      return 0
+    fi
+    # Rewrite in place rather than appending: two definitions of the same
+    # variable in a sourced file means the first one wins, silently.
+    local tmp; tmp="$(mktemp)"
+    sed -E "s|^[[:space:]]*:? *\"?\\\$\\{$var:=.*|$line|" "$conf" > "$tmp" && mv "$tmp" "$conf"
+    ok "fleet.conf: $var updated"
+  else
+    printf '%s\n' "$line" >> "$conf"
+    ok "fleet.conf: $var recorded"
+  fi
+}
+
+# --------------------------------------------------------------- bootstrap
+ensure_namespace() {
+  if kube get namespace "$NAMESPACE" >/dev/null 2>&1; then
+    skip "namespace $NAMESPACE exists"
+  else
+    kube create namespace "$NAMESPACE" >/dev/null 2>&1 \
+      && ok "namespace $NAMESPACE created" || die "could not create namespace $NAMESPACE"
+  fi
+}
+
+ensure_pull_secret() {
+  [ -n "${K8S_REGISTRY_USER:-}" ] && [ -n "${K8S_REGISTRY_TOKEN:-}" ] \
+    || { skip "no registry pull credentials yet - run ./cluster.sh image"; return 0; }
+  ensure_namespace
+  # Recreated rather than compared: a docker-registry secret is an opaque
+  # blob of JSON and "is it already right" costs more than rewriting it.
+  kube -n "$NAMESPACE" delete secret "$PULL_SECRET" >/dev/null 2>&1
+  kube -n "$NAMESPACE" create secret docker-registry "$PULL_SECRET" \
+    --docker-server="$REGISTRY" \
+    --docker-username="$K8S_REGISTRY_USER" \
+    --docker-password="$K8S_REGISTRY_TOKEN" >/dev/null 2>&1 \
+    && ok "pull secret $PULL_SECRET set for $REGISTRY" \
+    || die "could not create the registry pull secret"
+}
+
+# clever-tools 4.5 has no `config-provider` subcommand, but its `curl`
+# passes our credentials to the public API, which does. Same call
+# provision.sh makes - one source of truth for what the fleet knows.
+cp_read() {
+  clever curl -s \
+    "https://api.clever-cloud.com/v4/addon-providers/config-provider/addons/$1/env" 2>/dev/null
+}
+
+addon_real_id_by_name() {
+  clever addon list ${ORG_ARGS[@]+"${ORG_ARGS[@]}"} --format json 2>/dev/null \
+    | jq -r --arg n "$1" '.[] | select(.name==$n) | .realId' | head -1
+}
+addon_id_by_name() {
+  clever addon list ${ORG_ARGS[@]+"${ORG_ARGS[@]}"} --format json 2>/dev/null \
+    | jq -r --arg n "$1" '.[] | select(.name==$n) | .addonId' | head -1
+}
+
+# The pods get exactly what the VMs get, from exactly where the VMs get it
+# - the shared Configuration provider - plus the Cellar credentials, which
+# a VM receives from its linked add-on and a pod has no add-on to receive.
+#
+# A pod that authenticates from a second, hand-maintained list of secrets
+# is a pod that stops matching the fleet the first time a token rotates.
+cmd_secrets() {
+  hdr "agent secrets"
+  need jq; ensure_kubectl; ensure_namespace
+
+  local config_id env_json
+  config_id="$(addon_real_id_by_name "$CONFIG_ADDON")"
+  [ -n "$config_id" ] || die "no Configuration provider named $CONFIG_ADDON.
+    Create it with: ./provision.sh --shared-only   (no VM required)"
+  env_json="$(cp_read "$config_id")"
+  printf '%s' "$env_json" | json_has 'length > 0' \
+    || die "the shared configuration $CONFIG_ADDON is empty or unreadable"
+
+  # Cellar, so `cellar` works in a pod and the entrypoint can push ~/out
+  # somewhere that outlives it.
+  local cellar_id cellar_json
+  cellar_id="$(addon_id_by_name "$CELLAR_ADDON")"
+  if [ -n "$cellar_id" ]; then
+    cellar_json="$(clever addon env "$cellar_id" --format json 2>/dev/null)"
+  else
+    cellar_json='{}'
+    skip "no Cellar add-on named $CELLAR_ADDON - pods will have nowhere to leave results"
+  fi
+
+  # Written through a file, not through `kubectl create secret --from-literal`:
+  # literals land in this machine's process list, and one of them is the
+  # fleet's commit key.
+  local tmp; tmp="$(mktemp)"; chmod 600 "$tmp"
+  {
+    echo "apiVersion: v1"
+    echo "kind: Secret"
+    echo "metadata:"
+    echo "  name: $SECRET_NAME"
+    echo "  labels:"
+    echo "    vm-agent/managed: \"true\""
+    echo "type: Opaque"
+    echo "data:"
+    # VM_AGENT_KUBECONFIG_B64 is deliberately dropped: a pod that can spawn
+    # pods is a fleet that can fork itself by accident, and nothing in the
+    # pod workflow needs it.
+    printf '%s' "$env_json" | jq -r '
+      .[]
+      | select(.name != "VM_AGENT_KUBECONFIG_B64")
+      | "  \(.name): \(.value | @base64)"'
+    printf '%s' "$cellar_json" | jq -r '
+      to_entries[]
+      | select(.key | startswith("CELLAR_ADDON_"))
+      | "  \(.key): \(.value | @base64)"'
+  } > "$tmp"
+
+  if kube -n "$NAMESPACE" apply -f "$tmp" >/dev/null 2>&1; then
+    ok "secret $SECRET_NAME synced ($(grep -c '^  [A-Z]' "$tmp") variables)"
+  else
+    rm -f "$tmp"; die "could not write the secret $SECRET_NAME"
+  fi
+  rm -f "$tmp"
+
+  printf '%s' "$env_json" | json_has '.[] | select(.name=="VM_AGENT_FLEET_TOKEN")' \
+    || warn "no VM_AGENT_FLEET_TOKEN in the shared config - a pod's endpoint will
+  fail closed and swarm will not be able to talk to it"
+
+  # Every agent in a cluster is unattended - a job has no pane at all, and
+  # even a `swarm start` pod is only reachable through a deliberate
+  # `swarm keys`. acceptEdits is a sane fleet default for VMs someone
+  # attaches to; here it means the agent asks for approval it can never
+  # get, and returns that request as its answer.
+  local mode
+  mode="$(printf '%s' "$env_json" \
+    | jq -r '.[]? | select(.name=="CLAUDE_PERMISSION_MODE") | .value' | head -1)"
+  if [ -n "$mode" ] && [ "$mode" != bypassPermissions ]; then
+    warn "agents in this cluster will run with CLAUDE_PERMISSION_MODE=$mode."
+    warn "  Pods are unattended by construction, so a headless job will refuse"
+    warn "  anything beyond file edits - a web search, a novel shell command -"
+    warn "  and answer with a request for approval nobody can grant. To change"
+    warn "  it for the fleet, set CLAUDE_PERMISSION_MODE in fleet.conf, then:"
+    warn "    ./provision.sh --shared-only  &&  ./cluster.sh secrets"
+    warn "  Note this is a real decision: the pods hold a push-capable commit"
+    warn "  key and your forge tokens. Per-run: swarm run … --env NAME=VALUE."
+  fi
+}
+
+cmd_bootstrap() {
+  hdr "namespace [$NAMESPACE]"
+  need jq; ensure_kubectl
+  ensure_namespace
+  ensure_pull_secret
+  cmd_secrets
+  write_local_k8s_env
+}
+
+cmd_storage() {
+  hdr "persistent storage"
+  local status; status="$(cluster_status)"
+  [ "$status" = ACTIVE ] || die "cluster $CLUSTER is ${status:-missing}, not ACTIVE"
+  ensure_kubectl
+  if kube get storageclass -o name 2>/dev/null | grep -q ceph; then
+    skip "a Ceph storage class is already present"
+    kube get storageclass
+    return 0
+  fi
+  confirm "enable persistent storage (Ceph CSI) on '$CLUSTER'? it is billed per volume."
+  clever k8s add-persistent-storage "$CLUSTER" ${ORG_ARGS[@]+"${ORG_ARGS[@]}"} >/dev/null 2>&1 \
+    && ok "persistent storage requested - the storage class appears in a minute or two" \
+    || die "could not enable persistent storage"
+}
+
+cmd_status() {
+  hdr "cluster [$CLUSTER]"
+  local json; json="$(cluster_json)"
+  if [ -z "$json" ]; then
+    skip "no cluster named $CLUSTER in this organisation"
+    return 0
+  fi
+  printf '%s' "$json" | jq -r '"  \(.name)  \(.id)  status \(.status)  version \(.version // "?")"'
+  [ -s "$KUBECONFIG_PATH" ] || { skip "no local kubeconfig - ./cluster.sh kubeconfig"; return 0; }
+  ensure_kubectl
+
+  hdr "nodes"
+  kube get nodes -o wide 2>/dev/null | sed 's/^/  /' || warn "cluster unreachable"
+
+  hdr "namespace [$NAMESPACE]"
+  if kube get namespace "$NAMESPACE" >/dev/null 2>&1; then
+    kube -n "$NAMESPACE" get pods -l vm-agent/managed=true 2>/dev/null | sed 's/^/  /'
+  else
+    skip "namespace $NAMESPACE does not exist - ./cluster.sh bootstrap"
+  fi
+}
+
+cmd_doctor() {
+  hdr "doctor"
+  local bad=0
+  step() {  # $1 label, $2.. command
+    local label="$1"; shift
+    if "$@" >/dev/null 2>&1; then ok "$label"; else warn "$label"; bad=$(( bad + 1 )); fi
+  }
+  cluster_is_active() { [ "$(cluster_status)" = ACTIVE ]; }
+  has_nodegroup() { nodegroups | jq -e 'length > 0' >/dev/null 2>&1; }
+  has_ready_node() {
+    env KUBECONFIG="$KUBECONFIG_PATH" kubectl get nodes --no-headers 2>/dev/null \
+      | grep -qw Ready
+  }
+  # K8S_IMAGE lives in fleet.conf, which a pod-only fleet may not have at
+  # all - but cluster.sh always records the image in .secrets/k8s.env too,
+  # and that is the copy `swarm` actually reads. Checking only the first
+  # reported a working setup as broken.
+  image_is_recorded() {
+    [ -n "${K8S_IMAGE:-}" ] && return 0
+    [ -s "$SECRETS_DIR/k8s.env" ] || return 1
+    local v
+    v="$( unset VM_AGENT_K8S_IMAGE; . "$SECRETS_DIR/k8s.env" >/dev/null 2>&1
+          printf '%s' "${VM_AGENT_K8S_IMAGE:-}" )"
+    [ -n "$v" ]
+  }
+
+  step "clever-tools is logged in"        clever profile
+  step "the k8s feature is enabled"       k8s_feature_on
+  step "cluster $CLUSTER is ACTIVE"       cluster_is_active
+  step "the cluster has a node group"     has_nodegroup
+  step "a kubeconfig exists"              test -s "$KUBECONFIG_PATH"
+  if [ ! -s "$KUBECONFIG_PATH" ]; then
+    # Everything below needs a cluster to ask. Downloading kubectl to find
+    # out there is nothing to point it at is 50MB of wasted certainty.
+    hdr "no kubeconfig - skipping the cluster-side checks"
+    printf '  %s\n' "./cluster.sh create   then   ./cluster.sh image"
+    exit 1
+  fi
+  ensure_kubectl
+  step "the cluster answers"              env KUBECONFIG="$KUBECONFIG_PATH" kubectl version --request-timeout=15s
+  step "at least one node is Ready"       has_ready_node
+  step "namespace $NAMESPACE exists"      env KUBECONFIG="$KUBECONFIG_PATH" kubectl get namespace "$NAMESPACE"
+  step "pull secret $PULL_SECRET exists"  env KUBECONFIG="$KUBECONFIG_PATH" kubectl -n "$NAMESPACE" get secret "$PULL_SECRET"
+  step "agent secret $SECRET_NAME exists" env KUBECONFIG="$KUBECONFIG_PATH" kubectl -n "$NAMESPACE" get secret "$SECRET_NAME"
+  step "the agent image is recorded"      image_is_recorded
+  if [ "$bad" -eq 0 ]; then
+    hdr "ready"
+    printf '  %s\n' "swarm run hello 'reply with the word ok' --wait"
+  else
+    hdr "$bad check(s) failed"
+    has_nodegroup || printf '  %s\n' "./cluster.sh nodes    give the cluster something to run on"
+    printf '  %s\n' "./cluster.sh create   then   ./cluster.sh image   then   ./cluster.sh bootstrap"
+    exit 1
+  fi
+}
+
+cmd_destroy() {
+  hdr "destroying [$CLUSTER]"
+  local status; status="$(cluster_status)"
+  [ -n "$status" ] || { skip "no cluster named $CLUSTER"; return 0; }
+  confirm "delete cluster '$CLUSTER' and everything running on it?"
+  clever k8s delete "$CLUSTER" ${ORG_ARGS[@]+"${ORG_ARGS[@]}"} --yes >/dev/null 2>&1 \
+    && ok "cluster deleted" || die "could not delete $CLUSTER"
+  rm -f "$KUBECONFIG_PATH" && skip "removed .secrets/kubeconfig.yaml"
+  if fleet_has_vms; then
+    warn "the VMs still carry VM_AGENT_KUBECONFIG_B64. Clear it with:"
+    warn "  ./provision.sh --all --no-deploy --forget VM_AGENT_KUBECONFIG_B64"
+  else
+    warn "the shared config may still carry VM_AGENT_KUBECONFIG_B64. Clear it with:"
+    warn "  ./provision.sh --shared-only --forget VM_AGENT_KUBECONFIG_B64"
+  fi
+  warn "The GitLab project and its images are untouched."
+}
+
+print_header_comment() {
+  awk 'NR > 1 { if (/^#/) { sub(/^# ?/, ""); print } else { exit } }' "$0"
+}
+usage() { print_header_comment; exit "${1:-0}"; }
+
+# ------------------------------------------------------------------ main
+need clever; need jq; need curl
+
+ACTION=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --org|--owner) CLEVER_ORG="$2"; shift 2 ;;
+    --cluster)   CLUSTER="$2"; shift 2 ;;
+    --namespace) NAMESPACE="$2"; shift 2 ;;
+    --nodes)     NODES="$2"; shift 2 ;;
+    --project)   IMAGE_PROJECT="$2"; shift 2 ;;
+    --registry)  REGISTRY="$2"; shift 2 ;;
+    --image-name) IMAGE_NAME="$2"; shift 2 ;;
+    # A whole reference, tag included or not. Splitting on the last colon
+    # only when it comes after the last slash, so a registry with a port -
+    # localhost:5000/x - is not mistaken for a tag.
+    --image)     IMAGE_REPOSITORY="$2"
+                 case "${2##*/}" in
+                   *:*) IMAGE_TAG="${2##*:}"; IMAGE_REPOSITORY="${2%:*}" ;;
+                 esac
+                 shift 2 ;;
+    --tag)       IMAGE_TAG="$2"; shift 2 ;;
+    --no-push)   PUSH=false; shift ;;
+    --no-wait)   WAIT=false; shift ;;
+    --yes|-y)    CONFIRMED=true; shift ;;
+    -h|--help)   usage ;;
+    -*)          die "unknown option: $1" ;;
+    *)           [ -n "$ACTION" ] && die "one action at a time (got '$ACTION' and '$1')"
+                 ACTION="$1"; shift ;;
+  esac
+done
+
+clever profile >/dev/null 2>&1 || die "not logged in - run 'clever login' first"
+
+# Same check provision.sh makes, for the same reason: clever accepts an
+# organisation name, but a name that matches nothing is only reported once
+# it has already created something somewhere else.
+if [ -n "$CLEVER_ORG" ]; then
+  orgs="$(clever curl -s https://api.clever-cloud.com/v2/organisations 2>/dev/null)"
+  if [ -z "$orgs" ]; then
+    say "could not list your organisations - passing --org through unchecked"
+  else
+    match="$(printf '%s' "$orgs" | jq -r --arg o "$CLEVER_ORG" \
+      '[.[] | select(.id == $o or .name == $o)] | if length == 1 then .[0].id else empty end')"
+    [ -n "$match" ] || {
+      printf '%s\n' "$c_err  ✗ no single organisation matches '$CLEVER_ORG'. You belong to:$c_off" >&2
+      printf '%s' "$orgs" | jq -r '.[] | "      \(.id)  \(.name)"' >&2
+      exit 1
+    }
+    CLEVER_ORG="$match"
+  fi
+  ORG_ARGS=(--org "$CLEVER_ORG")
+fi
+
+case "${ACTION:-status}" in
+  create)     cmd_create ;;
+  image)      cmd_image ;;
+  bootstrap)  cmd_bootstrap ;;
+  secrets)    cmd_secrets ;;
+  kubeconfig) cmd_kubeconfig ;;
+  nodes)      cmd_nodes ;;
+  storage)    cmd_storage ;;
+  status)     cmd_status ;;
+  doctor)     cmd_doctor ;;
+  destroy)    cmd_destroy ;;
+  *)          die "unknown action: $ACTION (try --help)" ;;
+esac
