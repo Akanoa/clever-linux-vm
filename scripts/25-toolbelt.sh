@@ -67,6 +67,43 @@ DOCKER
 )"
 fi
 
+k8s_section=""
+if [ -n "${VM_AGENT_KUBECONFIG_B64:-}" ]; then
+  k8s_section="$(cat <<'K8S'
+
+This fleet also has a **Kubernetes cluster**, and you can spawn agents into
+it. A pod is not a smaller VM - it starts in seconds from a prebuilt image,
+has no bucket, and nothing on its filesystem outlives it. That makes it the
+right shape for work that fans out and the wrong shape for anything you
+want to come back to tomorrow.
+
+```sh
+swarm run <name> "the whole task, in one prompt"   # a Job: answers, then vanishes
+swarm run <name> "..." --repo <git-url> --wait     # clone first, block for the answer
+swarm fetch <name>                                 # the answer
+swarm ls                                           # what is running
+```
+
+`swarm run` is the one to reach for. It is a single headless run: the
+prompt goes in, the agent's answer comes back on stdout, the pod is reaped.
+Ten of them in parallel cost nothing to set up, which is the whole point.
+
+`swarm start <name>` is the other shape - a long-lived pod with herdr in
+it, driven by `swarm prompt|read|abort|task|fetch`, exactly the verbs
+`fleet` uses for a VM. Use it when you need to correct an agent mid-task.
+Kill it yourself when you are done; nothing else will.
+
+**Results leave a pod through git or through `~/out/`, and nowhere else.**
+`~/out/` is copied to Cellar when the pod stops, which is what `swarm
+fetch` reads once the pod is gone.
+
+Two things pods do not have: a shared `~/shared`, and your VM's workspace.
+If a pod needs a repository, pass `--repo`; if it needs to hand something
+back that is not an answer, have it push a branch.
+K8S
+)"
+fi
+
 block="$(cat <<BLOCK
 $BEGIN
 # This machine
@@ -163,7 +200,7 @@ just sits there. \`--here\` is the older spelling of \`.\` and still works.
   every 5 minutes and on shutdown).
 - \`~/shared\` - a directory every VM in the fleet can read and write.
 
-$docker_section## What persists
+$docker_section$k8s_section## What persists
 
 \`~/workspace\` is written straight through to network storage. Agent state
 (\`~/.claude\`, \`~/.codex\`, \`~/.moerae\`, herdr layout) is snapshotted to it.
