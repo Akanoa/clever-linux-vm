@@ -743,6 +743,32 @@ once and kept in `.secrets/registry.env`. Anything able to read a secret in
 the namespace can read that pull credential — a personal access token there
 would hand the same reader your whole GitLab account.
 
+### Unattended means `bypassPermissions`
+
+A pod agent has nobody at the keyboard, and a `swarm run` job has no pane
+at all — there is no `swarm keys` to answer with, because there is no
+terminal to answer into. `acceptEdits`, the fleet default, auto-approves
+file edits and **re-asks for everything else**: a web search, a novel
+shell command. Headless, that prompt cannot be answered, so the run
+completes and the answer is the agent asking for approval:
+
+> It looks like WebSearch permission wasn't granted — could you approve it?
+
+which reads like a bad reply rather than a misconfiguration. `swarm run`
+warns at dispatch when the cluster's mode is not `bypassPermissions`, and
+so does `./cluster.sh secrets` when it publishes one.
+
+It is a real decision, not a formality — the pods carry a push-capable
+commit key and your forge tokens, exactly as the VMs do. Set it
+deliberately in `fleet.conf`:
+
+```bash
+: "${CLAUDE_PERMISSION_MODE:=bypassPermissions}"
+```
+
+then `./provision.sh --shared-only && ./cluster.sh secrets`. For one run
+only, `swarm run … --env CLAUDE_PERMISSION_MODE=bypassPermissions`.
+
 ### What a pod does not have
 
 * **No bucket.** `~/workspace` and `~/out` are container filesystem, and

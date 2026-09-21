@@ -797,6 +797,25 @@ cmd_secrets() {
   printf '%s' "$env_json" | json_has '.[] | select(.name=="VM_AGENT_FLEET_TOKEN")' \
     || warn "no VM_AGENT_FLEET_TOKEN in the shared config - a pod's endpoint will
   fail closed and swarm will not be able to talk to it"
+
+  # Every agent in a cluster is unattended - a job has no pane at all, and
+  # even a `swarm start` pod is only reachable through a deliberate
+  # `swarm keys`. acceptEdits is a sane fleet default for VMs someone
+  # attaches to; here it means the agent asks for approval it can never
+  # get, and returns that request as its answer.
+  local mode
+  mode="$(printf '%s' "$env_json" \
+    | jq -r '.[]? | select(.name=="CLAUDE_PERMISSION_MODE") | .value' | head -1)"
+  if [ -n "$mode" ] && [ "$mode" != bypassPermissions ]; then
+    warn "agents in this cluster will run with CLAUDE_PERMISSION_MODE=$mode."
+    warn "  Pods are unattended by construction, so a headless job will refuse"
+    warn "  anything beyond file edits - a web search, a novel shell command -"
+    warn "  and answer with a request for approval nobody can grant. To change"
+    warn "  it for the fleet, set CLAUDE_PERMISSION_MODE in fleet.conf, then:"
+    warn "    ./provision.sh --shared-only  &&  ./cluster.sh secrets"
+    warn "  Note this is a real decision: the pods hold a push-capable commit"
+    warn "  key and your forge tokens. Per-run: swarm run … --env NAME=VALUE."
+  fi
 }
 
 cmd_bootstrap() {

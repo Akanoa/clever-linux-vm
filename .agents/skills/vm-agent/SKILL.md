@@ -331,6 +331,23 @@ from the cluster's shared secret for that pod alone — `env` beats
 agent needs a different permission mode or model; the secret is read by
 every agent in the cluster.
 
+### Pods need `bypassPermissions`
+
+A `swarm run` job is headless: no pane, no keyboard, no `swarm keys`. With
+`acceptEdits` — the fleet default — the agent auto-approves file edits and
+re-asks for everything else, cannot be answered, and returns the request
+for approval *as its answer*. That looks like a poor reply, not a
+misconfiguration, so check it before blaming the prompt:
+
+```bash
+swarm run … --env CLAUDE_PERMISSION_MODE=bypassPermissions   # one run
+```
+
+Fleet-wide it belongs in `fleet.conf`, followed by
+`./provision.sh --shared-only && ./cluster.sh secrets`. Treat it as the
+security decision it is: the pods hold a push-capable commit key and the
+forge tokens. `swarm run` warns at dispatch when the mode cannot work.
+
 ### What a pod does not have
 
 * **No bucket, no `~/shared`, no VM workspace.** Results leave through git

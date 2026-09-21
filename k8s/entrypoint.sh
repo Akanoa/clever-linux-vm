@@ -157,8 +157,16 @@ run_job() {
   case "$KIND" in
     claude)
       argv=(claude -p "$prompt")
-      [ -n "${CLAUDE_PERMISSION_MODE:-}" ] \
-        && argv+=(--permission-mode "$CLAUDE_PERMISSION_MODE") ;;
+      if [ -n "${CLAUDE_PERMISSION_MODE:-}" ]; then
+        argv+=(--permission-mode "$CLAUDE_PERMISSION_MODE")
+        # Nobody can answer a prompt in here. acceptEdits auto-approves
+        # file edits and re-asks for everything else - a web search, a
+        # novel shell command - so the run completes and the "answer" is
+        # the agent asking for approval it will never get.
+        [ "$CLAUDE_PERMISSION_MODE" = bypassPermissions ] \
+          || log "WARNING: permission mode is '$CLAUDE_PERMISSION_MODE'; this run is" \
+                 "headless, so any tool beyond file edits will be refused"
+      fi ;;
     codex)    argv=(codex exec "$prompt") ;;
     opencode) argv=(opencode run "$prompt") ;;
     *)        log "FATAL: unsupported VM_AGENT_KIND for job mode: $KIND"; return 64 ;;
