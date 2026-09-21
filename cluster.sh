@@ -14,6 +14,7 @@
 #   ./cluster.sh secrets             refresh the agent secrets only
 #   ./cluster.sh status              cluster, nodes, and what is running
 #   ./cluster.sh kubeconfig          (re)fetch it into .secrets/kubeconfig.yaml
+#   ./cluster.sh nodes               list node groups, adding one if there is none
 #   ./cluster.sh storage             enable persistent volumes (Ceph CSI)
 #   ./cluster.sh doctor              check the whole path end to end
 #   ./cluster.sh destroy --yes       delete the cluster
@@ -32,6 +33,10 @@
 #                     your personal space)
 #   --cluster <name>  cluster name (default: <FLEET_NAME>-k8s)
 #   --namespace <ns>  namespace for the agents (default: vm-agent)
+#   --nodes <flavor:count>  size of the node group created with the
+#                     cluster (default M:1). Nodes are billed separately
+#                     from the control plane, and an existing node group
+#                     is never resized by a re-run.
 #   --project <path>  gitlab.com project whose registry holds the image
 #   --tag <tag>       image tag (default: latest)
 #   --no-push         image: build only, do not push
@@ -78,6 +83,11 @@ if [ "$GITLAB_HOST_VALUE" = gitlab.com ]; then
 else
   REGISTRY="${K8S_REGISTRY:-registry.$GITLAB_HOST_VALUE}"
 fi
+NODEGROUP="${K8S_NODEGROUP:-agents}"
+# <flavor>:<count>. A cluster is billed for its control plane *and* its
+# nodes, so this is the one default in the file that costs money by
+# existing - it is deliberately one small node rather than a pool.
+NODES="${K8S_NODES:-M:1}"
 PULL_SECRET="${K8S_PULL_SECRET:-gitlab-registry}"
 SECRET_NAME="${K8S_SECRET:-vm-agent-env}"
 CLEVER_ORG="${CLEVER_ORG:-}"
@@ -179,6 +189,88 @@ cluster_json() {
 
 cluster_status() { cluster_json | jq -r '.status // ""'; }
 
+# ------------------------------------------------------------- nodes
+# `clever k8s create` builds a control plane and nothing else: on
+# clever-tools 4.5 there is no --nodegroup flag at all, and node groups
+# only arrived as a subcommand in 4.9. A cluster with no node group is
+# ACTIVE, answers kubectl, accepts a pod - and then leaves it Pending for
+# ever, because there is nowhere to run it. That is a bad thing to learn
+# from a hanging demo, so this manages them over the same v4 API the CLI
+# uses, which works on whatever clever-tools you have.
+k8s_api() {  # $1 method, $2 path under the cluster, [$3 JSON body]
+  local owner method="$1" path="$2" body="${3:-}"
+  owner="$(owner_id)" || return 1
+  local url="https://api.clever-cloud.com/v4/kubernetes/organisations/$owner/clusters/$(cluster_id)$path"
+  if [ -n "$body" ]; then
+    clever curl -s -X "$method" "$url" -H "Content-Type: application/json" -d "$body" 2>/dev/null
+  else
+    clever curl -s -X "$method" "$url" 2>/dev/null
+  fi
+}
+
+owner_id() {
+  if [ -n "$CLEVER_ORG" ]; then printf '%s' "$CLEVER_ORG"; return 0; fi
+  clever curl -s https://api.clever-cloud.com/v2/self 2>/dev/null | jq -r '.id // empty'
+}
+
+cluster_id() { cluster_json | jq -r '.id // empty'; }
+
+node_flavors() {
+  clever curl -s https://api.clever-cloud.com/v4/kubernetes-product 2>/dev/null \
+    | jq -r '[.topologies[]?.availableFlavors] | flatten | unique | join(" ")' 2>/dev/null
+}
+
+nodegroups() { k8s_api GET /node-groups; }
+
+# Creates the fleet's node group if the cluster has none at all. It does
+# not touch an existing one: resizing a pool someone sized on purpose is
+# not something a provisioning re-run should decide.
+ensure_nodegroup() {
+  local current flavor count valid
+  current="$(nodegroups)"
+  if printf '%s' "$current" | jq -e 'length > 0' >/dev/null 2>&1; then
+    skip "node groups: $(printf '%s' "$current" | jq -r '[.[] | "\(.name) \(.flavor)x\(.targetNodeCount)"] | join(", ")')"
+    return 0
+  fi
+
+  flavor="${NODES%%:*}"; count="${NODES##*:}"
+  case "$count" in ''|*[!0-9]*) die "K8S_NODES must be <flavor>:<count>, got '$NODES'" ;; esac
+  valid="$(node_flavors)"
+  if [ -n "$valid" ]; then
+    # Accept a lowercase spelling and hand the API the one it wants.
+    local canon; canon="$(printf '%s\n' $valid | grep -ixF -- "$flavor" | head -1)"
+    [ -n "$canon" ] || die "unknown node flavor '$flavor' - pick one of: $valid"
+    flavor="$canon"
+  fi
+
+  confirm "add node group '$NODEGROUP' ($flavor x $count) to '$CLUSTER'? nodes are billed."
+  say "creating node group $NODEGROUP ($flavor x $count)"
+  local out
+  out="$(k8s_api POST /node-groups "$(jq -nc --arg n "$NODEGROUP" --arg f "$flavor" \
+    --argjson c "$count" '{name:$n, flavor:$f, targetNodeCount:$c}')")"
+  if printf '%s' "$out" | jq -e '.id // .name' >/dev/null 2>&1; then
+    ok "node group created - nodes take a few minutes to register"
+  else
+    printf '%s\n' "$out" | head -c 300 >&2; printf '\n' >&2
+    die "could not create the node group"
+  fi
+}
+
+cmd_nodes() {
+  hdr "nodes [$CLUSTER]"
+  local status; status="$(cluster_status)"
+  [ "$status" = ACTIVE ] || die "cluster $CLUSTER is ${status:-missing}, not ACTIVE"
+  ensure_nodegroup
+  local groups; groups="$(nodegroups)"
+  printf '%s' "$groups" | jq -r '.[]? | "  \(.name)  \(.flavor) x \(.targetNodeCount)  \(.status // "?")"'
+  if [ -s "$KUBECONFIG_PATH" ]; then
+    ensure_kubectl
+    hdr "registered with the cluster"
+    kube get nodes 2>/dev/null | sed 's/^/  /' \
+      || skip "no nodes yet - they take a few minutes to join"
+  fi
+}
+
 cmd_create() {
   hdr "cluster [$CLUSTER]"
   ensure_feature
@@ -241,6 +333,9 @@ cmd_create() {
     return 0
   fi
 
+  # A control plane with no node group cannot run anything, and nothing
+  # else in this script would notice.
+  ensure_nodegroup
   cmd_kubeconfig
   cmd_bootstrap
   hdr "next"
@@ -759,11 +854,25 @@ cmd_doctor() {
     if "$@" >/dev/null 2>&1; then ok "$label"; else warn "$label"; bad=$(( bad + 1 )); fi
   }
   cluster_is_active() { [ "$(cluster_status)" = ACTIVE ]; }
-  image_is_recorded() { [ -n "${K8S_IMAGE:-}" ]; }
+  has_nodegroup() { nodegroups | jq -e 'length > 0' >/dev/null 2>&1; }
+  has_ready_node() {
+    env KUBECONFIG="$KUBECONFIG_PATH" kubectl get nodes --no-headers 2>/dev/null \
+      | grep -qw Ready
+  }
+  # K8S_IMAGE lives in fleet.conf, which a pod-only fleet may not have at
+  # all - but cluster.sh always records the image in .secrets/k8s.env too,
+  # and that is the copy `swarm` actually reads. Checking only the first
+  # reported a working setup as broken.
+  image_is_recorded() {
+    [ -n "${K8S_IMAGE:-}" ] && return 0
+    [ -s "$SECRETS_DIR/k8s.env" ] \
+      && grep -q '^export VM_AGENT_K8S_IMAGE="..*"' "$SECRETS_DIR/k8s.env"
+  }
 
   step "clever-tools is logged in"        clever profile
   step "the k8s feature is enabled"       k8s_feature_on
   step "cluster $CLUSTER is ACTIVE"       cluster_is_active
+  step "the cluster has a node group"     has_nodegroup
   step "a kubeconfig exists"              test -s "$KUBECONFIG_PATH"
   if [ ! -s "$KUBECONFIG_PATH" ]; then
     # Everything below needs a cluster to ask. Downloading kubectl to find
@@ -774,6 +883,7 @@ cmd_doctor() {
   fi
   ensure_kubectl
   step "the cluster answers"              env KUBECONFIG="$KUBECONFIG_PATH" kubectl version --request-timeout=15s
+  step "at least one node is Ready"       has_ready_node
   step "namespace $NAMESPACE exists"      env KUBECONFIG="$KUBECONFIG_PATH" kubectl get namespace "$NAMESPACE"
   step "pull secret $PULL_SECRET exists"  env KUBECONFIG="$KUBECONFIG_PATH" kubectl -n "$NAMESPACE" get secret "$PULL_SECRET"
   step "agent secret $SECRET_NAME exists" env KUBECONFIG="$KUBECONFIG_PATH" kubectl -n "$NAMESPACE" get secret "$SECRET_NAME"
@@ -783,6 +893,7 @@ cmd_doctor() {
     printf '  %s\n' "swarm run hello 'reply with the word ok' --wait"
   else
     hdr "$bad check(s) failed"
+    has_nodegroup || printf '  %s\n' "./cluster.sh nodes    give the cluster something to run on"
     printf '  %s\n' "./cluster.sh create   then   ./cluster.sh image   then   ./cluster.sh bootstrap"
     exit 1
   fi
@@ -820,6 +931,7 @@ while [ $# -gt 0 ]; do
     --org|--owner) CLEVER_ORG="$2"; shift 2 ;;
     --cluster)   CLUSTER="$2"; shift 2 ;;
     --namespace) NAMESPACE="$2"; shift 2 ;;
+    --nodes)     NODES="$2"; shift 2 ;;
     --project)   IMAGE_PROJECT="$2"; shift 2 ;;
     --tag)       IMAGE_TAG="$2"; shift 2 ;;
     --no-push)   PUSH=false; shift ;;
@@ -860,6 +972,7 @@ case "${ACTION:-status}" in
   bootstrap)  cmd_bootstrap ;;
   secrets)    cmd_secrets ;;
   kubeconfig) cmd_kubeconfig ;;
+  nodes)      cmd_nodes ;;
   storage)    cmd_storage ;;
   status)     cmd_status ;;
   doctor)     cmd_doctor ;;

@@ -80,6 +80,15 @@
 # : "${K8S_IMAGE:=registry.gitlab.com/your-name/vm-agent-images/agent:latest}"
 : "${K8S_IMAGE_TAG:=latest}"
 
+# The node group created with the cluster, as <flavor>:<count>. Valid
+# flavors are 2XS XS S M L XL. `clever k8s create` builds a control plane
+# and nothing else, so without this the cluster is ACTIVE, answers
+# kubectl, accepts a pod - and leaves it Pending for ever. Nodes are
+# billed separately from the control plane; an existing node group is
+# never resized by a re-run.
+: "${K8S_NODEGROUP:=agents}"
+: "${K8S_NODES:=M:1}"
+
 # What one agent pod asks for. A pod that only edits and tests code is
 # happy here; one that compiles a large Rust workspace is not.
 : "${K8S_AGENT_CPU:=1}"

@@ -770,6 +770,34 @@ who is mid-task lives in `provision.sh` — so `cluster.sh` leaves the
 kubeconfig in `.secrets/` and the settings in `fleet.conf`, and
 `./provision.sh --all --no-deploy` publishes them when the fleet is quiet.
 
+### The cluster needs nodes, and does not get them by default
+
+`clever k8s create` builds a **control plane and nothing else**. The
+cluster then reports `ACTIVE`, answers `kubectl`, and accepts a pod —
+which stays `Pending` for ever, because there is nowhere to run it. On
+clever-tools 4.5 there is no flag to say otherwise; node groups only
+became a subcommand in 4.9.
+
+So `cluster.sh create` adds one, and `./cluster.sh nodes` is the way to
+add or inspect one on a cluster that has none:
+
+```bash
+./cluster.sh nodes                 # list; create the default if there is none
+./cluster.sh nodes --nodes L:3     # a bigger pool
+```
+
+It goes through the same `/v4/kubernetes` API the CLI uses, so it works
+whatever clever-tools you have — the same reason the shared configuration
+is written with `clever curl`. `K8S_NODES` in `fleet.conf` is the lasting
+default, as `<flavor>:<count>` over `2XS XS S M L XL`. **Nodes are billed
+separately from the control plane**, so an existing node group is never
+resized by a re-run; change it deliberately, with `clever k8s nodegroups`
+on a recent clever-tools or from the Console.
+
+`./cluster.sh doctor` checks both that a node group exists and that a node
+has actually registered — they are minutes apart, and a pod scheduled in
+between waits without saying why.
+
 ### `clever k8s` is in beta
 
 The cluster commands are behind an experimental flag (`clever features
