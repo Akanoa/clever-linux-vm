@@ -434,6 +434,18 @@ What each one actually does:
   builds `k8s/Dockerfile` with the repository root as context, pushes it,
   creates a `read_registry` deploy token for the cluster to pull with, and
   records `K8S_IMAGE` in `fleet.conf`.
+
+  **Any other registry** works through `--image`, which takes the whole
+  repository verbatim: `--image ghcr.io/you/vm-agent:v3`,
+  `--image docker.io/you/vm-agent`. The composed GitLab form is the
+  default, and `--registry` / `--image-name` / `--tag` set its pieces.
+  Outside GitLab the project creation and deploy-token steps are
+  **skipped** — they are GitLab API calls — so the repository must already
+  exist, the push leans on a `docker login` you did yourself, and
+  `K8S_REGISTRY_USER`/`K8S_REGISTRY_TOKEN` in `.secrets/registry.env` are
+  what the cluster pulls with. Without them no pull secret is written and
+  the image has to be public; `cluster.sh` warns rather than letting it
+  surface later as an `ImagePullBackOff`.
 * **`provision.sh --all --no-deploy`** publishes the kubeconfig, namespace
   and image to the shared config, so the VMs can spawn pods too. **This
   restarts every VM**, so check `fleet agents` for busy ones first — it
