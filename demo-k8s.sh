@@ -220,6 +220,9 @@ cmd_stop() {
   printf '%s\n' "$c_dim  remove it with: ./cluster.sh destroy --yes$c_off"
 }
 
+# `demo-k8s.sh <verb> --help` too, not just the bare form.
+case "${2:-}" in -h|--help) print_header_comment; exit 0 ;; esac
+
 case "${1:-start}" in
   start)  cmd_start ;;
   layout) cmd_layout ;;

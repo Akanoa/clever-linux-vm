@@ -67,12 +67,20 @@ PULL_SECRET="${VM_AGENT_K8S_PULL_SECRET:-gitlab-registry}"
 
 c_ok=$'\033[32m'; c_dim=$'\033[2m'; c_err=$'\033[31m'; c_off=$'\033[0m'
 die()  { printf '%s%s%s\n' "$c_err" "swarm: $*" "$c_off" >&2; exit 1; }
+# `${1:?usage: ...}` routes through bash's own error path, which prints
+# "swarm: line 333: 2: usage: ..." - the text is there, buried under a
+# line number and an argument index that mean nothing to the caller.
+usage() { printf '%s%s%s\n' "$c_err" "usage: swarm $*" "$c_off" >&2; exit 1; }
 warn() { printf '%s%s%s\n' "$c_err" "  ! $*" "$c_off" >&2; }
 
 # Before anything is checked: asking what this does must work on a machine
 # with no cluster. Print the whole leading comment, not a line range - that
 # silently drops the last option as soon as anyone adds one.
-if [ "${1:-}" = -h ] || [ "${1:-}" = --help ]; then
+# Both `swarm --help` and `swarm <verb> --help`. The second is what anyone
+# actually types once they know the verb exists, and it used to be parsed
+# as the verb's first argument and die complaining about the next one.
+if [ "${1:-}" = -h ] || [ "${1:-}" = --help ] \
+   || [ "${2:-}" = -h ] || [ "${2:-}" = --help ]; then
   awk 'NR > 1 { if (/^#/) { sub(/^# ?/, ""); print } else { exit } }' "$0"
   exit 0
 fi
@@ -329,8 +337,8 @@ age_of() {  # an ISO timestamp -> 3m / 2h / 4d
 }
 
 cmd_run() {
-  local name="${1:?usage: swarm run <name> \"prompt\" [options]}"
-  local prompt="${2:?usage: swarm run <name> \"prompt\" [options]}"
+  [ $# -ge 2 ] || usage 'run <name> "prompt" [options]'
+  local name="$1" prompt="$2"
   valid_name "$name"; shift 2; parse_opts "$@"
 
   local job; job="$(job_of "$name")"
@@ -399,7 +407,8 @@ MANIFEST
 }
 
 cmd_start() {
-  local name="${1:?usage: swarm start <name> [kind] [options]}"
+  [ $# -ge 1 ] || usage 'start <name> [kind] [options]'
+  local name="$1"
   valid_name "$name"; shift
   # `swarm start build codex --repo …` - the kind may be positional, the
   # way `fleet start` takes it, or a flag.
@@ -483,7 +492,8 @@ MANIFEST
 }
 
 cmd_fetch() {
-  local name="${1:?usage: swarm fetch <name> [file]}" file="${2:-}"
+  [ $# -ge 1 ] || usage 'fetch <name> [file]'
+  local name="$1" file="${2:-}"
   valid_name "$name"
   local pod; pod="$(pod_of "$name")"
 
@@ -529,8 +539,8 @@ case "$cmd" in
     valid_name "$1"; require_pod "$1"; pod_api GET "$POD" /status | jq . ;;
 
   prompt)
-    split_target "${1:?usage: swarm prompt <name>[/<agent>] \"text\"}"
-    [ $# -ge 2 ] || die 'usage: swarm prompt <name>[/<agent>] "text"'
+    [ $# -ge 2 ] || usage 'prompt <name>[/<agent>] "text"'
+    split_target "$1"
     require_pod "$TGT_NAME"
     pod_api POST "$POD" "/agents/$TGT_AGENT/prompt" body \
       <<< "$(jq -nc --arg t "$2" '{text:$t}')" | jq . ;;
@@ -538,8 +548,8 @@ case "$cmd" in
   task)
     # Same reasoning as `fleet task`: agent UIs collapse tool output, so
     # the terminal is not a transport. Ask for a file instead.
-    split_target "${1:?usage: swarm task <name>[/<agent>] \"text\"}"
-    [ $# -ge 2 ] || die 'usage: swarm task <name>[/<agent>] "text"'
+    [ $# -ge 2 ] || usage 'task <name>[/<agent>] "text"'
+    split_target "$1"
     full="$2
 
 When you are finished, write your complete answer to ~/out/$TGT_AGENT.md
@@ -552,7 +562,8 @@ print one line: WROTE ~/out/$TGT_AGENT.md"
       | jq -r '"submitted; collect with: swarm fetch '"$TGT_NAME $TGT_AGENT"'.md"' ;;
 
   read)
-    split_target "${1:?usage: swarm read <name>[/<agent>] [-f]}"
+    [ $# -ge 1 ] || usage 'read <name>[/<agent>] [-f]'
+    split_target "$1"
     require_pod "$TGT_NAME"; pod="$POD"; follow=false; source=recent
     for a in "${@:2}"; do
       case "$a" in
@@ -581,9 +592,9 @@ print one line: WROTE ~/out/$TGT_AGENT.md"
     done ;;
 
   keys)
-    split_target "${1:?usage: swarm keys <name>[/<agent>] <key>...}"
+    [ $# -ge 2 ] || usage 'keys <name>[/<agent>] <key>...'
+    split_target "$1"
     shift
-    [ $# -ge 1 ] || die "usage: swarm keys <name>[/<agent>] <key>..."
     require_pod "$TGT_NAME"
     pod_api POST "$POD" "/agents/$TGT_AGENT/keys" body \
       <<< "$(printf '%s\n' "$@" | jq -Rsc 'split("\n") | map(select(length>0)) | {keys:.}')" \
@@ -592,7 +603,8 @@ print one line: WROTE ~/out/$TGT_AGENT.md"
   abort)
     # Retract an order. `prompt` queues *behind* the work in flight, so an
     # orchestrator that changes its mind has no other way back.
-    split_target "${1:?usage: swarm abort <name>[/<agent>] [--tell \"…\"] [--timeout N]}"
+    [ $# -ge 1 ] || usage 'abort <name>[/<agent>] [--tell "…"] [--timeout N]'
+    split_target "$1"
     shift; tell=""; budget=20
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -639,12 +651,14 @@ print one line: WROTE ~/out/$TGT_AGENT.md"
     fi ;;
 
   out)
-    valid_name "${1:?usage: swarm out <name>}"
+    [ $# -ge 1 ] || usage 'out <name>'
+    valid_name "$1"
     require_pod "$1"
     pod_api GET "$POD" /out | jq -r '.files[]? | "\(.bytes)\t\(.name)"' ;;
 
   logs)
-    valid_name "${1:?usage: swarm logs <name> [-f]}"
+    [ $# -ge 1 ] || usage 'logs <name> [-f]'
+    valid_name "$1"
     # Either shape may be behind the name, and a Job's pod has a generated
     # suffix - so select by label rather than guessing the object.
     if kubectl -n "$NS" get pod "$(pod_of "$1")" >/dev/null 2>&1; then
@@ -654,7 +668,8 @@ print one line: WROTE ~/out/$TGT_AGENT.md"
     fi ;;
 
   herdr)
-    valid_name "${1:?usage: swarm herdr <name> <args>...   (no args: what is permitted)}"
+    [ $# -ge 1 ] || usage 'herdr <name> <args>...   (no args: what is permitted)'
+    valid_name "$1"
     require_pod "$1"; pod="$POD"; shift
     if [ $# -eq 0 ]; then
       pod_api GET "$pod" /herdr | jq .
@@ -664,7 +679,8 @@ print one line: WROTE ~/out/$TGT_AGENT.md"
     fi ;;
 
   attach)
-    valid_name "${1:?usage: swarm attach <name>}"
+    [ $# -ge 1 ] || usage 'attach <name>'
+    valid_name "$1"
     # herdr's own UI, straight over the exec channel - no tmux and no ssh
     # gateway to work around, which is the one thing easier here than on a
     # VM. ctrl+b is herdr's prefix; ctrl+b q detaches and leaves it running.
@@ -672,7 +688,8 @@ print one line: WROTE ~/out/$TGT_AGENT.md"
     exec kubectl -n "$NS" exec -it "$POD" -c agent -- sh -lc 'herdr' ;;
 
   shell)
-    valid_name "${1:?usage: swarm shell <name>}"
+    [ $# -ge 1 ] || usage 'shell <name>'
+    valid_name "$1"
     require_pod "$1"
     exec kubectl -n "$NS" exec -it "$POD" -c agent -- bash -l ;;
 
@@ -702,8 +719,9 @@ print one line: WROTE ~/out/$TGT_AGENT.md"
           --field-selector 'status.phase==Failed' --wait=false 2>/dev/null | wc -l)"
     printf '%s  reaped %s succeeded, %s failed%s\n' "$c_ok" "$n" "$m" "$c_off" ;;
 
-  get)  require_pod "${1:?usage: swarm get <name> <path>}"
-        pod_api GET "$POD" "${2:?usage: swarm get <name> <path>}" ;;
+  get)  [ $# -ge 2 ] || usage 'get <name> <path>'
+        require_pod "$1"
+        pod_api GET "$POD" "$2" ;;
   ns)   printf '%s\n' "$NS" ;;
   *)    die "unknown command: $cmd (try --help)" ;;
 esac
