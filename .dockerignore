@@ -1,0 +1,14 @@
+# The build context is the repository root (k8s/Dockerfile and
+# dockerd/Dockerfile both COPY from it), so anything left here is uploaded
+# to the daemon on every build - and .secrets/ holds the fleet's commit
+# key. Neither Dockerfile COPYs it, but a build context is not the place
+# to find that out.
+.secrets/
+.clever.json
+fleet.conf
+fleet.conf.bak
+vms.txt
+persistent/
+node_modules/
+.git/
+*.log
