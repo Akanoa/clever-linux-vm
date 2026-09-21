@@ -373,7 +373,7 @@ Prerequisites, all on the machine you are running from:
 | The shared config published | `./provision.sh --shared-only` (no VM needed) |
 | An agent credential in it | or the pods start with no model access |
 | Docker or podman | to build the image |
-| `GITLAB_TOKEN` with `write_registry` | to push it |
+| `GITLAB_TOKEN` with `write_registry` | to push it — a **PAT**, not the OAuth token `glab auth login` stores |
 
 Then, in order. Every step is idempotent and `--yes` makes it
 non-interactive, so a partial failure is re-run rather than unpicked:
@@ -424,7 +424,8 @@ the first thing missing rather than the last thing that failed.
 | *no Configuration provider named …* | The shared config does not exist yet. Nothing was created. `./provision.sh --shared-only` — it needs no VM. |
 | *your quota exceeded, contact support* | The offer is quota-limited. If the organisation's Kubernetes quota is zero or already spent, this needs a support request, not a flag — `clever k8s quota` shows it on clever-tools 4.9+. |
 | `create` sits on `CREATING` for a long time | Normal. It polls for 30 minutes before giving up. |
-| *could not log in to registry.gitlab.com* | `GITLAB_TOKEN` is missing `write_registry`, or is expired. `glab auth status` checks it. |
+| *registry.gitlab.com rejected the credential* | Checked before the build, so nothing is wasted. Usually an OAuth token from a browser `glab auth login`, which the registry does not accept — store a PAT with `write_registry` instead. |
+| *docker buildx is unusable here* | Environmental, not fatal: docker falls back to the legacy builder and `cluster.sh` says so. Fix or remove `~/.docker/cli-plugins/docker-buildx` to silence docker's own DEPRECATED notice. |
 | `ImagePullBackOff` on every pod | The pull secret is stale or the tag does not exist. Re-run `./cluster.sh image --yes`. |
 | `swarm` says *no kubectl* | The kubeconfig was never published. `./provision.sh --all --no-deploy`. |
 | `swarm` says *no image* | `K8S_IMAGE` was never published. Same fix, after `./cluster.sh image`. |

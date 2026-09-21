@@ -707,6 +707,18 @@ this image is built from your working tree by your own Docker and pushed
 as a finished artefact. What the cluster runs is the tag you pushed, so
 `--tag` is the version control here.
 
+The push credential is checked **before** the build, not after it: the
+build is minutes and the check is one request, so finding out at the end
+that nothing can be pushed wastes all of them. It takes `GITLAB_TOKEN` if
+set, otherwise the token `glab` already holds.
+
+One trap worth knowing: the token `glab auth login` stores after a
+*browser* login is an OAuth token, and the container registry does not
+generally accept one — so being logged in to `glab` is not enough by
+itself, even though it is enough to create the project. A personal access
+token with `write_registry` is the reliable answer, and the error says so
+if the registry refuses.
+
 The project is created on confirmation if it does not exist. Two different
 credentials are used on purpose: **your** token pushes (it needs
 `write_registry`, and it never leaves your machine), while the cluster

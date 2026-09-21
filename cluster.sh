@@ -374,6 +374,68 @@ image_ref() {
   printf '%s:%s' "$path" "$IMAGE_TAG"
 }
 
+# The credential that pushes. GITLAB_TOKEN is the fleet's own answer and
+# wins; failing that, glab's stored login is a perfectly good token that
+# this machine already holds - and it is the one ensure_project just used,
+# so refusing to push with it while happily creating projects with it
+# would be an odd place to draw a line.
+resolve_push_token() {
+  PUSH_TOKEN="${GITLAB_TOKEN:-}"
+  PUSH_SOURCE="GITLAB_TOKEN"
+  if [ -z "$PUSH_TOKEN" ] && command -v glab >/dev/null 2>&1; then
+    PUSH_TOKEN="$(glab config get token --host "$GITLAB_HOST_VALUE" 2>/dev/null)"
+    PUSH_SOURCE="glab's stored login for $GITLAB_HOST_VALUE"
+  fi
+  [ -n "$PUSH_TOKEN" ] || die "no GitLab credential to push the image with. Either:
+      ./agent-tokens.sh set GITLAB_TOKEN    (needs the write_registry scope), or
+      glab auth login                       and this will use that token
+    Or build without pushing: ./cluster.sh image --no-push"
+}
+
+# Proving the credential before the build rather than after it. The build
+# is minutes; this is one request, and finding out at the end that nothing
+# can be pushed wastes all of them.
+#
+# A successful login is not proof of write_registry - the registry issues
+# scoped tokens at push time, not at login - so the scope is checked
+# separately, and only as a warning, because a deploy token or a
+# group/CI token has no /personal_access_tokens/self to report.
+verify_push_credential() {
+  local builder="$1" user
+  resolve_push_token
+  user="$(gitlab_user)"
+  [ -n "$user" ] || die "cannot read your GitLab user - is the token valid?"
+  say "checking the push credential ($PUSH_SOURCE)"
+  printf '%s' "$PUSH_TOKEN" | "$builder" login "$REGISTRY" \
+    --username "$user" --password-stdin >/dev/null 2>&1 \
+    || die "$REGISTRY rejected the credential from $PUSH_SOURCE.
+    The container registry wants a personal access token with the
+    write_registry scope. Note that the token \`glab auth login\` stores
+    after a browser login is an OAuth token, which the registry does not
+    generally accept - so being logged in to glab is not enough on its own:
+      ./agent-tokens.sh set GITLAB_TOKEN    paste a PAT with write_registry"
+  ok "logged in to $REGISTRY as $user"
+
+  # Informational only, and best effort. Reached only after a successful
+  # login, so it answers "will the push itself be refused" rather than
+  # "can I authenticate" - the registry issues its scoped token at push
+  # time, not at login, so the two are genuinely different questions.
+  local self scopes
+  self="$(gitlab_api /personal_access_tokens/self)"
+  scopes="$(printf '%s' "$self" | jq -r '.scopes[]?' 2>/dev/null | paste -sd" ")"
+  if [ -n "$scopes" ]; then
+    case " $scopes " in
+      *" write_registry "*|*" api "*) skip "token scopes: $scopes" ;;
+      *) warn "token scopes are '$scopes' - neither write_registry nor api is among"
+         warn "  them, so the push will most likely be refused. Continuing anyway." ;;
+    esac
+  elif printf '%s' "$self" | grep -q 'personal access token'; then
+    # A deploy token, a CI job token or an OAuth token. None of them can
+    # report their own scopes, and the first two are legitimate here.
+    skip "not a personal access token, so its scopes cannot be read - pushing anyway"
+  fi
+}
+
 cmd_image() {
   hdr "agent image"
   need jq
@@ -382,11 +444,28 @@ cmd_image() {
   [ -n "$builder" ] || die "no container builder found (docker, podman or nerdctl)
     the image can also be built on a VM that has --dockerd; see the README"
 
+  # Everything cheap and fallible, before the expensive and slow part.
+  $PUSH && verify_push_credential "$builder"
   ensure_project
   local ref; ref="$(image_ref)"
 
+  # A broken or missing buildx plugin makes `docker build` print
+  # "failed to fetch metadata: ... exec format error" and a DEPRECATED
+  # banner before falling back to the legacy builder. It is environmental,
+  # it is not fatal, and it lands in the middle of our output where it
+  # reads like our failure - so ask for the legacy builder explicitly,
+  # which drops the first message, and explain the second.
+  local -a build_env=()
+  if [ "$builder" = docker ] && ! docker buildx version >/dev/null 2>&1; then
+    build_env=(DOCKER_BUILDKIT=0)
+    say "docker buildx is unusable here, so this uses the legacy builder"
+    printf '%s\n' "$c_skip    the DEPRECATED notice below is docker's and is harmless;$c_off"
+    printf '%s\n' "$c_skip    to be rid of it, fix or remove ~/.docker/cli-plugins/docker-buildx$c_off"
+  fi
+
   say "building $ref with $builder (context: the repository root)"
-  "$builder" build -f "$ROOT/k8s/Dockerfile" -t "$ref" "$ROOT" \
+  env ${build_env[@]+"${build_env[@]}"} \
+    "$builder" build -f "$ROOT/k8s/Dockerfile" -t "$ref" "$ROOT" \
     || die "image build failed"
   ok "built $ref"
 
@@ -395,12 +474,7 @@ cmd_image() {
     return 0
   fi
 
-  [ -n "${GITLAB_TOKEN:-}" ] || die "GITLAB_TOKEN is not set - it is what pushes to the registry
-    ./agent-tokens.sh set GITLAB_TOKEN"
-  say "logging in to $REGISTRY"
-  printf '%s' "$GITLAB_TOKEN" | "$builder" login "$REGISTRY" \
-    --username "$(gitlab_user)" --password-stdin >/dev/null 2>&1 \
-    || die "could not log in to $REGISTRY - does GITLAB_TOKEN have write_registry?"
+  # Already authenticated above, before the build.
   "$builder" push "$ref" || die "could not push $ref"
   ok "pushed $ref"
 
