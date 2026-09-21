@@ -38,6 +38,17 @@
 #                     from the control plane, and an existing node group
 #                     is never resized by a re-run.
 #   --project <path>  gitlab.com project whose registry holds the image
+#   --registry <host> registry host (default: registry.gitlab.com, or
+#                     registry.<GITLAB_HOST> for a self-managed instance)
+#   --image-name <n>  last segment of the repository (default: agent)
+#   --image <ref>     the whole repository, verbatim, tag optional. This is
+#                     how you point at a registry that does not nest the
+#                     way GitLab does - ghcr.io/you/vm-agent,
+#                     docker.io/you/vm-agent, localhost:5000/vm-agent.
+#                     Outside GitLab nothing can be created for you, so
+#                     the project must exist and K8S_REGISTRY_USER /
+#                     K8S_REGISTRY_TOKEN in .secrets/registry.env are what
+#                     the cluster pulls with.
 #   --tag <tag>       image tag (default: latest)
 #   --no-push         image: build only, do not push
 #   --no-wait         create: return as soon as the cluster is accepted
@@ -76,6 +87,12 @@ GITLAB_HOST_VALUE="${GITLAB_HOST:-gitlab.com}"
 IMAGE_PROJECT="${K8S_IMAGE_PROJECT:-}"
 IMAGE_NAME="${K8S_IMAGE_NAME:-agent}"
 IMAGE_TAG="${K8S_IMAGE_TAG:-latest}"
+# The whole repository, registry host included and tag excluded. Set, it is
+# used verbatim and the three parts above are ignored - which is the only
+# way to express a registry that does not nest the way GitLab's does:
+# ghcr.io/owner/name, docker.io/user/name, an ECR or Harbor path. Unset,
+# the reference is composed as <registry>/<project>/<name>.
+IMAGE_REPOSITORY="${K8S_IMAGE_REPOSITORY:-}"
 # gitlab.com's registry is on its own host; a self-managed instance
 # usually puts it on registry.<host>, but not always - hence the override.
 if [ "$GITLAB_HOST_VALUE" = gitlab.com ]; then
@@ -509,9 +526,38 @@ ensure_deploy_token() {
 # push somewhere else.
 image_ref() {
   local path
-  path="$(printf '%s/%s/%s' "$REGISTRY" "$IMAGE_PROJECT" "$IMAGE_NAME" \
-    | tr '[:upper:]' '[:lower:]')"
-  printf '%s:%s' "$path" "$IMAGE_TAG"
+  if [ -n "$IMAGE_REPOSITORY" ]; then
+    path="$IMAGE_REPOSITORY"
+  else
+    path="$(printf '%s/%s/%s' "$REGISTRY" "$IMAGE_PROJECT" "$IMAGE_NAME")"
+  fi
+  printf '%s:%s' "$(printf '%s' "$path" | tr '[:upper:]' '[:lower:]')" "$IMAGE_TAG"
+}
+
+# The registry host of whatever reference we are going to build, which is
+# what decides whether the GitLab-specific steps below apply at all.
+image_registry() {
+  if [ -n "$IMAGE_REPOSITORY" ]; then
+    # A reference with no registry host - "user/name" - is Docker Hub by
+    # convention: the first segment is only a host if it looks like one.
+    local first="${IMAGE_REPOSITORY%%/*}"
+    case "$first" in
+      *.*|*:*|localhost) printf '%s' "$first" ;;
+      *)                 printf 'docker.io' ;;
+    esac
+  else
+    printf '%s' "$REGISTRY"
+  fi
+}
+
+# Creating a project and minting a read_registry deploy token are GitLab
+# API calls. Against ghcr.io or Docker Hub they are meaningless, so they
+# are skipped rather than attempted and reported as failures.
+is_gitlab_registry() {
+  case "$(image_registry)" in
+    registry.gitlab.com|"registry.$GITLAB_HOST_VALUE"|"$GITLAB_HOST_VALUE") return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # The credential that pushes. GITLAB_TOKEN is the fleet's own answer and
@@ -520,6 +566,14 @@ image_ref() {
 # so refusing to push with it while happily creating projects with it
 # would be an odd place to draw a line.
 resolve_push_token() {
+  # A non-GitLab registry has no glab to fall back on: the credential is
+  # whatever the caller put in .secrets/registry.env, or a docker login
+  # they already did themselves.
+  if ! is_gitlab_registry; then
+    PUSH_TOKEN="${K8S_REGISTRY_TOKEN:-}"
+    PUSH_SOURCE=".secrets/registry.env"
+    return 0
+  fi
   PUSH_TOKEN="${GITLAB_TOKEN:-}"
   PUSH_SOURCE="GITLAB_TOKEN"
   if [ -z "$PUSH_TOKEN" ] && command -v glab >/dev/null 2>&1; then
@@ -543,6 +597,24 @@ resolve_push_token() {
 verify_push_credential() {
   local builder="$1" user
   resolve_push_token
+
+  if ! is_gitlab_registry; then
+    # Nothing here knows how to mint a credential for an arbitrary
+    # registry, and a docker login the caller already performed is a
+    # perfectly good answer - so check what we can and get out of the way.
+    if [ -z "${K8S_REGISTRY_USER:-}" ] || [ -z "$PUSH_TOKEN" ]; then
+      skip "no K8S_REGISTRY_USER/K8S_REGISTRY_TOKEN for $(image_registry) -"
+      skip "  assuming '$builder login $(image_registry)' was already done"
+      return 0
+    fi
+    say "checking the push credential for $(image_registry)"
+    printf '%s' "$PUSH_TOKEN" | "$builder" login "$(image_registry)" \
+      --username "$K8S_REGISTRY_USER" --password-stdin >/dev/null 2>&1 \
+      || die "$(image_registry) rejected K8S_REGISTRY_USER/K8S_REGISTRY_TOKEN"
+    ok "logged in to $(image_registry) as $K8S_REGISTRY_USER"
+    return 0
+  fi
+
   user="$(gitlab_user)"
   [ -n "$user" ] || die "cannot read your GitLab user - is the token valid?"
   say "checking the push credential ($PUSH_SOURCE)"
@@ -586,7 +658,16 @@ cmd_image() {
 
   # Everything cheap and fallible, before the expensive and slow part.
   $PUSH && verify_push_credential "$builder"
-  ensure_project
+  if is_gitlab_registry; then
+    ensure_project
+  elif [ -z "$IMAGE_REPOSITORY" ]; then
+    die "K8S_REGISTRY is $(image_registry) but no K8S_IMAGE_REPOSITORY is set.
+    Outside GitLab the repository cannot be derived from a project path -
+    give the whole thing:
+      ./cluster.sh image --image ghcr.io/you/vm-agent"
+  else
+    skip "$(image_registry) is not a GitLab registry - using $IMAGE_REPOSITORY as given"
+  fi
   local ref; ref="$(image_ref)"
 
   # A broken or missing buildx plugin makes `docker build` print
@@ -620,8 +701,16 @@ cmd_image() {
 
   # The cluster has to be able to pull it, and the fleet has to know what
   # to spawn. Both are written where they are read from, not announced.
-  ensure_deploy_token
-  record_setting K8S_IMAGE_PROJECT "$IMAGE_PROJECT"
+  if is_gitlab_registry; then
+    ensure_deploy_token
+    record_setting K8S_IMAGE_PROJECT "$IMAGE_PROJECT"
+  else
+    record_setting K8S_IMAGE_REPOSITORY "$IMAGE_REPOSITORY"
+    [ -n "${K8S_REGISTRY_USER:-}" ] && [ -n "${K8S_REGISTRY_TOKEN:-}" ] \
+      || warn "no K8S_REGISTRY_USER/K8S_REGISTRY_TOKEN, so no pull secret can be
+  written. The cluster can only pull this image if it is public, or if a
+  pull secret named $PULL_SECRET already exists in namespace $NAMESPACE."
+  fi
   record_setting K8S_IMAGE "$ref"
   K8S_IMAGE="$ref"; write_local_k8s_env
   if [ -s "$KUBECONFIG_PATH" ]; then
@@ -980,6 +1069,16 @@ while [ $# -gt 0 ]; do
     --namespace) NAMESPACE="$2"; shift 2 ;;
     --nodes)     NODES="$2"; shift 2 ;;
     --project)   IMAGE_PROJECT="$2"; shift 2 ;;
+    --registry)  REGISTRY="$2"; shift 2 ;;
+    --image-name) IMAGE_NAME="$2"; shift 2 ;;
+    # A whole reference, tag included or not. Splitting on the last colon
+    # only when it comes after the last slash, so a registry with a port -
+    # localhost:5000/x - is not mistaken for a tag.
+    --image)     IMAGE_REPOSITORY="$2"
+                 case "${2##*/}" in
+                   *:*) IMAGE_TAG="${2##*:}"; IMAGE_REPOSITORY="${2%:*}" ;;
+                 esac
+                 shift 2 ;;
     --tag)       IMAGE_TAG="$2"; shift 2 ;;
     --no-push)   PUSH=false; shift ;;
     --no-wait)   WAIT=false; shift ;;

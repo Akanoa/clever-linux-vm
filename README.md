@@ -722,6 +722,33 @@ registry:
 ./cluster.sh image --no-push                    # build only
 ```
 
+### Somewhere other than GitLab
+
+The default reference is composed GitLab's way —
+`<registry>/<project>/<name>` — and each piece has a flag: `--registry`,
+`--project`, `--image-name`, `--tag`. That shape does not fit every
+registry, so `--image` takes the whole repository verbatim, tag optional:
+
+```bash
+./cluster.sh image --image ghcr.io/you/vm-agent:v3
+./cluster.sh image --image docker.io/you/vm-agent
+./cluster.sh image --image localhost:5000/vm-agent --tag dev
+```
+
+A first segment with a dot or a colon is read as a registry host, so
+`localhost:5000/vm-agent` is a host and a port rather than a repository
+and a tag, and a bare `you/vm-agent` means Docker Hub.
+
+**Outside GitLab, nothing is created for you.** Project creation and the
+`read_registry` deploy token are GitLab API calls; against ghcr.io or
+Docker Hub they are skipped rather than attempted. So the repository has
+to exist already, the push relies on a `docker login` you have done
+yourself (or `K8S_REGISTRY_USER`/`K8S_REGISTRY_TOKEN`), and those same two
+variables are what the cluster pulls with. Without them no pull secret is
+written, and the image has to be public or the secret already in place —
+`cluster.sh` says so rather than leaving you to find out from an
+`ImagePullBackOff`.
+
 Unlike `dockerd/Dockerfile`, this one does **not** have to be committed
 first: the companion daemon is deployed from git by the platform, while
 this image is built from your working tree by your own Docker and pushed

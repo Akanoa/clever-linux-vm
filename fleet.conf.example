@@ -73,10 +73,23 @@
 : "${K8S_CLUSTER:=vm-agent-k8s}"
 : "${K8S_NAMESPACE:=vm-agent}"
 
-# Where the agent image lives. `./cluster.sh image` fills both of these in
-# for you on its first successful push - K8S_IMAGE_PROJECT defaults to
-# <your gitlab user>/vm-agent-images, created on confirmation.
+# Where the agent image lives. `./cluster.sh image` fills these in for you
+# on its first successful push.
+#
+# The default path is GitLab's: <registry>/<project>/<name>, with the
+# project defaulting to <your gitlab user>/vm-agent-images and created on
+# confirmation. Override any piece:
 # : "${K8S_IMAGE_PROJECT:=your-name/vm-agent-images}"
+# : "${K8S_REGISTRY:=registry.example.com}"
+# : "${K8S_IMAGE_NAME:=agent}"
+#
+# Or name the whole repository and skip the composing entirely - which is
+# the only way to express a registry that does not nest like GitLab's:
+# : "${K8S_IMAGE_REPOSITORY:=ghcr.io/your-name/vm-agent}"
+#
+# Outside GitLab nothing can be created for you: the repository must
+# already exist, and K8S_REGISTRY_USER / K8S_REGISTRY_TOKEN in
+# .secrets/registry.env are what the cluster pulls with.
 # : "${K8S_IMAGE:=registry.gitlab.com/your-name/vm-agent-images/agent:latest}"
 : "${K8S_IMAGE_TAG:=latest}"
 
