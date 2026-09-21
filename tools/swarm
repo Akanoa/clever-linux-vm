@@ -1,0 +1,657 @@
+#!/usr/bin/env bash
+# Spawn and drive agents in the fleet's Kubernetes cluster.
+#
+# `fleet` is for the VMs: pets, with a workspace on a bucket and a herdr
+# session worth reattaching to tomorrow. This is for the pods: started in
+# seconds from a prebuilt image, told one thing, and thrown away. Same
+# agents, same credentials, same :8080 API - so the verbs below are
+# deliberately the ones `fleet` already uses.
+#
+# The transport is the difference. A VM publishes an HTTPS endpoint the
+# platform routes to; a pod publishes nothing, so every call below is a
+# `kubectl exec` into the pod's own loopback. That means the only
+# credential needed is the kubeconfig - the fleet token never leaves the
+# pod, because the curl that carries it runs inside it.
+#
+#   swarm ls                          what is running, pods and jobs
+#   swarm run <name> "prompt" [opts]  one-shot Job: answer, then vanish
+#   swarm start <name> [kind] [opts]  long-lived Pod with an agent in it
+#   swarm status [<name>]             the pod's own /status
+#   swarm prompt <name>[/<agent>] "…" submit a prompt
+#   swarm task <name>[/<agent>] "…"   prompt, and collect the answer to a file
+#   swarm read <name>[/<agent>] [-f]  recent terminal output (-f to follow)
+#   swarm keys <name>[/<agent>] esc   send key presses
+#   swarm abort <name>[/<agent>]      interrupt whatever it is doing
+#   swarm fetch <name> [file]         the answer: from the pod, its log, or Cellar
+#   swarm out <name>                  list a pod's result files
+#   swarm logs <name> [-f]            container log (this is where a Job answers)
+#   swarm herdr <name> <args>...      any permitted herdr subcommand
+#   swarm attach <name>               the pod's herdr UI, over kubectl exec
+#   swarm shell <name>                a shell in the pod
+#   swarm kill <name>...              delete a pod or job
+#   swarm reap                        delete everything already finished
+#
+# Options for run/start:
+#   --kind <claude|codex|opencode>    which agent (default claude)
+#   --repo <url> [--ref <ref>]        clone it, and start the agent in it
+#   --image <ref>                     override VM_AGENT_K8S_IMAGE
+#   --cpu <n> --memory <size>         resources (default 1 / 2Gi)
+#   --timeout <seconds>               run only: budget for the whole job
+#   --ttl <seconds>                   run only: how long the finished pod is kept
+#   --pvc <size>                      start only: a persistent ~/workspace
+#   --env NAME=VALUE                  override one variable from the cluster
+#                                     secret, for this pod only (repeatable)
+#   --wait                            block until the pod is ready (or the job ends)
+set -uo pipefail
+
+# On a VM the cluster's coordinates arrive as application variables from
+# the shared Configuration provider, exactly like the fleet roster does.
+# On a laptop there is no such environment, so cluster.sh leaves them in
+# .secrets/k8s.env - which also points KUBECONFIG at the fleet's own
+# cluster rather than at whatever your shell was last pointed at. That
+# override is deliberate: `swarm kill` should never be able to mean a
+# different cluster than `swarm ls` did a moment ago.
+for candidate in "$(dirname "${BASH_SOURCE[0]}")/../.secrets/k8s.env" \
+                 "$PWD/.secrets/k8s.env"; do
+  [ -f "$candidate" ] && . "$candidate" && break
+done
+
+NS="${VM_AGENT_K8S_NAMESPACE:-${K8S_NAMESPACE:-vm-agent}}"
+IMAGE_DEFAULT="${VM_AGENT_K8S_IMAGE:-${K8S_IMAGE:-}}"
+SECRET_NAME="${VM_AGENT_K8S_SECRET:-vm-agent-env}"
+PULL_SECRET="${VM_AGENT_K8S_PULL_SECRET:-gitlab-registry}"
+
+c_ok=$'\033[32m'; c_dim=$'\033[2m'; c_err=$'\033[31m'; c_off=$'\033[0m'
+die() { printf '%s%s%s\n' "$c_err" "swarm: $*" "$c_off" >&2; exit 1; }
+
+# Before anything is checked: asking what this does must work on a machine
+# with no cluster. Print the whole leading comment, not a line range - that
+# silently drops the last option as soon as anyone adds one.
+if [ "${1:-}" = -h ] || [ "${1:-}" = --help ]; then
+  awk 'NR > 1 { if (/^#/) { sub(/^# ?/, ""); print } else { exit } }' "$0"
+  exit 0
+fi
+
+command -v kubectl >/dev/null || die "no kubectl, which almost always means this fleet has no cluster yet.
+    A VM installs kubectl at boot, but only once a kubeconfig has been
+    published to it, so:
+      ./cluster.sh create              build the cluster (on a laptop)
+      ./cluster.sh image               build and publish the agent image
+      ./provision.sh --all --no-deploy hand the kubeconfig to the fleet"
+command -v jq >/dev/null || die "jq is required"
+kubectl version --request-timeout=10s >/dev/null 2>&1 \
+  || die "cannot reach the cluster - check KUBECONFIG (\${KUBECONFIG:-~/.kube/config})"
+
+k() { kubectl -n "$NS" "$@"; }
+
+# Pods are `agent-<name>`, jobs are `job-<name>`. The prefix is not
+# decoration: the namespace may hold whatever else the fleet deploys, and
+# `swarm ls` has to be able to say which workloads are its own.
+pod_of() { printf 'agent-%s' "$1"; }
+job_of() { printf 'job-%s' "$1"; }
+
+# <name> alone means the agent `main` that `swarm start` launches, so the
+# common case reads `swarm prompt build "..."` and not `build/main`.
+split_target() {  # sets TGT_NAME, TGT_AGENT
+  case "$1" in
+    */*) TGT_NAME="${1%%/*}"; TGT_AGENT="${1#*/}" ;;
+    *)   TGT_NAME="$1";       TGT_AGENT="main" ;;
+  esac
+  valid_name "$TGT_NAME"
+  # Both halves are interpolated into a URL that is evaluated by a shell
+  # inside the pod, so neither may carry anything but a name.
+  case "$TGT_AGENT" in
+    *[!A-Za-z0-9_-]*|"") die "bad agent name: '$TGT_AGENT'" ;;
+  esac
+}
+
+valid_name() {
+  case "$1" in
+    # RFC 1123, and short enough that `agent-<name>` still fits in 63.
+    *[!a-z0-9-]*|""|-*|*-) die "bad name: '$1' (lowercase letters, digits and - only)" ;;
+  esac
+  [ "${#1}" -le 50 ] || die "name too long: '$1' (50 characters max)"
+}
+
+json_has() {  # $1.. jq args (filter last); JSON on stdin
+  local doc; doc="$(cat)"
+  [ -n "$doc" ] || return 1
+  printf '%s' "$doc" | jq -e "$@" >/dev/null 2>&1
+}
+
+# The pod's endpoint, reached from inside the pod.
+#
+# The Authorization header is expanded by the shell *in the container*,
+# from the environment the cluster secret already gave it - so the fleet
+# token is never an argument here, never in this machine's process list,
+# and never in a kubectl audit log.
+pod_api() {  # method, pod, path, [anything = read a JSON body from stdin]
+  local method="$1" pod="$2" path="$3" body="${4:-}"
+  if [ -n "$body" ]; then
+    k exec -i "$pod" -c agent -- sh -c \
+      'curl -sS --max-time 60 -X "$0" "http://127.0.0.1:8080$1" \
+         -H "Authorization: Bearer $VM_AGENT_FLEET_TOKEN" \
+         -H "Content-Type: application/json" -d @-' "$method" "$path"
+  else
+    k exec "$pod" -c agent -- sh -c \
+      'curl -sS --max-time 30 -X "$0" "http://127.0.0.1:8080$1" \
+         -H "Authorization: Bearer $VM_AGENT_FLEET_TOKEN"' "$method" "$path"
+  fi
+}
+
+# Sets POD, rather than printing it. A function that resolves *and* dies
+# cannot do both through a command substitution: the subshell's exit takes
+# the subshell only, and the caller carries on with an empty pod name and
+# a confusing error from kubectl three lines later.
+require_pod() {  # $1 name -> sets POD
+  POD="$(pod_of "$1")"
+  k get pod "$POD" >/dev/null 2>&1 || die "no pod named $1 in namespace $NS
+    running: $(k get pods -l vm-agent/kind=pod -o jsonpath='{.items[*].metadata.labels.vm-agent/agent}' 2>/dev/null)"
+  local phase; phase="$(k get pod "$POD" -o jsonpath='{.status.phase}' 2>/dev/null)"
+  [ "$phase" = Running ] || die "$1 is $phase, not Running - try: swarm logs $1"
+}
+
+# ------------------------------------------------------------ manifests
+# Generated rather than templated from a file: every value below is either
+# a flag or a fleet-wide setting, and a heredoc keeps the substitution
+# where you can see it next to what it produces.
+#
+# runAsUser 10001 is the `agent` user baked into k8s/Dockerfile; fsGroup
+# matches so an attached PVC is writable, which it is not by default.
+#
+# Written at the indentation a Job wants, where the pod spec sits two
+# levels down under `template:`. A bare Pod puts the same block two levels
+# higher, so it pipes this through dedent4 - one block, two homes, rather
+# than two copies that drift.
+common_pod_spec() {  # name, mode, kind, image, cpu, memory, extra env block
+  cat <<SPEC
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      imagePullSecrets:
+        - name: $PULL_SECRET
+      containers:
+        - name: agent
+          image: $4
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: VM_AGENT_NAME
+              value: "$1"
+            - name: VM_AGENT_MODE
+              value: "$2"
+            - name: VM_AGENT_KIND
+              value: "$3"
+$7
+          envFrom:
+            - secretRef:
+                name: $SECRET_NAME
+          resources:
+            requests:
+              cpu: "$5"
+              memory: "$6"
+            limits:
+              memory: "$6"
+SPEC
+}
+
+# The env block above is a variable on its own line, so it leaves a blank
+# line behind whenever it is empty - legal YAML, but the manifests are
+# read by people when something goes wrong.
+strip_blanks() { sed '/^[[:space:]]*$/d'; }
+
+# Appends to EXTRA_ENV, rather than returning the pair. `x+="$(f)"` would
+# be the obvious spelling and is the wrong one: command substitution eats
+# the trailing newline, so the next entry lands on the end of the previous
+# line and the manifest stops being YAML halfway down.
+add_env() {  # name, value - indented for the env: list in common_pod_spec
+  # The value lands in a double-quoted YAML scalar, which escapes the same
+  # two characters JSON does. A branch name with a quote in it is unlikely;
+  # a manifest that silently stops parsing because of one is not worth the
+  # gamble.
+  local escaped; escaped="$(printf '%s' "$2" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  EXTRA_ENV+="$(printf '            - name: %s\n              value: "%s"' "$1" "$escaped")"$'\n'
+}
+
+# Values set here override the namespace's secret, because `env` wins over
+# `envFrom`. That is what makes a one-off override possible - a different
+# permission mode for a demo, a model pin for one experiment - without
+# rewriting the secret every agent in the cluster reads.
+add_override() {  # NAME=VALUE
+  case "$1" in
+    [A-Za-z_]*=*) ;;
+    *) die "--env wants NAME=VALUE, got '$1'" ;;
+  esac
+  local name="${1%%=*}"
+  case "$name" in
+    *[!A-Za-z0-9_]*) die "--env: '$name' is not a valid variable name" ;;
+  esac
+  add_env "$name" "${1#*=}"
+}
+
+dedent4() { sed 's/^    //'; }
+
+# ---------------------------------------------------------------- flags
+KIND=claude; REPO=""; REF=""; IMAGE=""; CPU=""; MEM=""
+TIMEOUT=3600; TTL=3600; PVC=""; WAIT=false; OVERRIDES=()
+parse_opts() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --kind)    KIND="${2:?--kind needs a value}"; shift 2 ;;
+      --repo)    REPO="${2:?--repo needs a URL}"; shift 2 ;;
+      --ref)     REF="${2:?--ref needs a ref}"; shift 2 ;;
+      --image)   IMAGE="${2:?--image needs a reference}"; shift 2 ;;
+      --cpu)     CPU="${2:?--cpu needs a value}"; shift 2 ;;
+      --memory)  MEM="${2:?--memory needs a value}"; shift 2 ;;
+      --timeout) TIMEOUT="${2:?--timeout needs seconds}"; shift 2 ;;
+      --ttl)     TTL="${2:?--ttl needs seconds}"; shift 2 ;;
+      --pvc)     PVC="${2:?--pvc needs a size, e.g. 10Gi}"; shift 2 ;;
+      --env)     OVERRIDES+=("${2:?--env needs NAME=VALUE}"); shift 2 ;;
+      --wait)    WAIT=true; shift ;;
+      *)         die "unknown option: $1" ;;
+    esac
+  done
+  IMAGE="${IMAGE:-$IMAGE_DEFAULT}"
+  CPU="${CPU:-${K8S_AGENT_CPU:-1}}"
+  MEM="${MEM:-${K8S_AGENT_MEMORY:-2Gi}}"
+  case "$KIND" in claude|codex|opencode) ;; *) die "unsupported kind: $KIND" ;; esac
+  [ -n "$IMAGE" ] || die "no image - set VM_AGENT_K8S_IMAGE, or pass --image
+    build and publish one with: ./cluster.sh image"
+}
+
+# ------------------------------------------------------------- commands
+cmd_ls() {
+  printf '  %-18s %-6s %-9s %-8s %-6s %s\n' NAME TYPE STATE AGE RESTART IMAGE
+  local none=true out
+  out="$(k get pods -l vm-agent/managed=true \
+    -o jsonpath='{range .items[*]}{.metadata.labels.vm-agent/agent}{"\t"}{.metadata.labels.vm-agent/kind}{"\t"}{.status.phase}{"\t"}{.metadata.creationTimestamp}{"\t"}{.status.containerStatuses[0].restartCount}{"\t"}{.spec.containers[0].image}{"\n"}{end}' \
+    2>/dev/null)"
+  while IFS=$'\t' read -r name kind phase created restarts image; do
+    [ -n "$name" ] || continue
+    none=false
+    local colour="$c_dim"
+    case "$phase" in
+      Running)   colour="$c_ok" ;;
+      Failed)    colour="$c_err" ;;
+    esac
+    printf '  %-18s %-6s %s%-9s%s %-8s %-6s %s\n' \
+      "$name" "${kind:-?}" "$colour" "$phase" "$c_off" \
+      "$(age_of "$created")" "${restarts:-0}" "${image##*/}"
+  done <<< "$out"
+  $none && printf '  %snothing running in namespace %s%s\n' "$c_dim" "$NS" "$c_off"
+}
+
+age_of() {  # an ISO timestamp -> 3m / 2h / 4d
+  local born now d
+  born="$(date -d "$1" +%s 2>/dev/null)" || { printf '?'; return; }
+  now="$(date +%s)"; d=$(( now - born ))
+  if   [ "$d" -lt 120 ];    then printf '%ss' "$d"
+  elif [ "$d" -lt 7200 ];   then printf '%sm' $(( d / 60 ))
+  elif [ "$d" -lt 172800 ]; then printf '%sh' $(( d / 3600 ))
+  else                           printf '%sd' $(( d / 86400 )); fi
+}
+
+cmd_run() {
+  local name="${1:?usage: swarm run <name> \"prompt\" [options]}"
+  local prompt="${2:?usage: swarm run <name> \"prompt\" [options]}"
+  valid_name "$name"; shift 2; parse_opts "$@"
+
+  local job; job="$(job_of "$name")"
+  k get job "$job" >/dev/null 2>&1 && die "$name already exists - 'swarm kill $name' first"
+
+  # The prompt travels base64'd. It is arbitrary prose with newlines and
+  # quotes in it, and the one thing a YAML document cannot be asked to
+  # carry unescaped is arbitrary prose.
+  EXTRA_ENV=""
+  add_env VM_AGENT_PROMPT_B64 "$(printf '%s' "$prompt" | base64 -w0)"
+  add_env VM_AGENT_TIMEOUT "$TIMEOUT"
+  [ -n "$REPO" ] && add_env VM_AGENT_REPO "$REPO"
+  [ -n "$REF" ]  && add_env VM_AGENT_REF "$REF"
+  for o in ${OVERRIDES[@]+"${OVERRIDES[@]}"}; do add_override "$o"; done
+
+  # backoffLimit 0 on purpose. A failed agent run is not a flaky pod: it
+  # already changed a working tree, maybe pushed a branch, and re-running
+  # the same prompt from scratch is rarely the repair anyone wanted.
+  k apply -f - >/dev/null <<MANIFEST || die "could not create job $name"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: $job
+  labels:
+    vm-agent/managed: "true"
+    vm-agent/agent: "$name"
+    vm-agent/kind: "job"
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: $TTL
+  activeDeadlineSeconds: $(( TIMEOUT + 300 ))
+  template:
+    metadata:
+      labels:
+        vm-agent/managed: "true"
+        vm-agent/agent: "$name"
+        vm-agent/kind: "job"
+    spec:
+      restartPolicy: Never
+$(common_pod_spec "$name" job "$KIND" "$IMAGE" "$CPU" "$MEM" "$EXTRA_ENV" | strip_blanks)
+MANIFEST
+  printf '%s  %s dispatched (%s, %ss budget)%s\n' "$c_ok" "$name" "$KIND" "$TIMEOUT" "$c_off"
+  printf '%s  follow it with: swarm logs %s -f   collect it with: swarm fetch %s%s\n' \
+    "$c_dim" "$name" "$name" "$c_off"
+
+  if $WAIT; then
+    k wait --for=condition=complete --timeout="$(( TIMEOUT + 300 ))s" "job/$job" >/dev/null 2>&1 \
+      || k wait --for=condition=failed --timeout=10s "job/$job" >/dev/null 2>&1
+    cmd_fetch "$name"
+  fi
+}
+
+cmd_start() {
+  local name="${1:?usage: swarm start <name> [kind] [options]}"
+  valid_name "$name"; shift
+  # `swarm start build codex --repo …` - the kind may be positional, the
+  # way `fleet start` takes it, or a flag.
+  case "${1:-}" in
+    claude|codex|opencode) KIND="$1"; shift ;;
+  esac
+  parse_opts "$@"
+
+  local pod; pod="$(pod_of "$name")"
+  k get pod "$pod" >/dev/null 2>&1 && die "$name already exists - 'swarm kill $name' first"
+
+  local volumes="" mounts=""
+  EXTRA_ENV=""
+  [ -n "$REPO" ] && add_env VM_AGENT_REPO "$REPO"
+  [ -n "$REF" ]  && add_env VM_AGENT_REF "$REF"
+  for o in ${OVERRIDES[@]+"${OVERRIDES[@]}"}; do add_override "$o"; done
+
+  # A workspace that outlives the pod. Off by default - the whole point of
+  # a pod agent is that it does not accumulate - but a long build with a
+  # cold cargo cache is a real reason to want one.
+  if [ -n "$PVC" ]; then
+    k apply -f - >/dev/null <<PVCDEF || die "could not create the volume claim"
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: $pod
+  labels:
+    vm-agent/managed: "true"
+    vm-agent/agent: "$name"
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: $PVC
+PVCDEF
+    # Pod depth, matching the dedented spec below: container keys at 6,
+    # pod-spec keys at 2.
+    mounts=$'\n      volumeMounts:\n        - name: workspace\n          mountPath: /home/agent/workspace'
+    volumes=$'\n  volumes:\n    - name: workspace\n      persistentVolumeClaim:\n        claimName: '"$pod"
+  fi
+
+  # A pod is killed, never finished, and the only chance it gets to copy
+  # ~/out to Cellar is the grace period after SIGTERM. 30s is the default
+  # and is not enough for a slow S3 write over a busy link.
+  k apply -f - >/dev/null <<MANIFEST || die "could not create pod $name"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $pod
+  labels:
+    vm-agent/managed: "true"
+    vm-agent/agent: "$name"
+    vm-agent/kind: "pod"
+spec:
+  restartPolicy: Always
+  terminationGracePeriodSeconds: 90
+$(common_pod_spec "$name" pod "$KIND" "$IMAGE" "$CPU" "$MEM" "$EXTRA_ENV" | strip_blanks | dedent4)$mounts$volumes
+MANIFEST
+  printf '%s  %s created%s\n' "$c_ok" "$name" "$c_off"
+
+  printf '%s  waiting for it to be ready…%s\n' "$c_dim" "$c_off"
+  if ! k wait --for=condition=Ready --timeout=300s "pod/$pod" >/dev/null 2>&1; then
+    die "$name did not become ready in 300s - look at: swarm logs $name"
+  fi
+  # Ready is the kubelet's opinion; the endpoint answering is ours.
+  local tries=0
+  until pod_api GET "$pod" /status 2>/dev/null | json_has '.ready == true'; do
+    tries=$(( tries + 1 ))
+    [ "$tries" -gt 60 ] && die "$name is running but never finished provisioning
+    look at: swarm logs $name"
+    sleep 5
+  done
+
+  # One agent, named `main`, so `swarm prompt <name> "..."` works with no
+  # second step. More can be added with `swarm herdr`.
+  printf '%s  starting the %s agent…%s\n' "$c_dim" "$KIND" "$c_off"
+  pod_api POST "$pod" /agents body \
+    <<< "$(jq -nc --arg k "$KIND" '{name:"main", kind:$k}')" \
+    | jq '{started, status: .agent.agent_status, ready: .agent.interactive_ready, hint}'
+  printf '%s  drive it with: swarm prompt %s "…"%s\n' "$c_dim" "$name" "$c_off"
+}
+
+cmd_fetch() {
+  local name="${1:?usage: swarm fetch <name> [file]}" file="${2:-}"
+  valid_name "$name"
+  local pod; pod="$(pod_of "$name")"
+
+  # Three places an answer can be, in the order they stop being true.
+  # Live pod first: it is the only one that is current while the agent is
+  # still writing.
+  if k get pod "$pod" >/dev/null 2>&1 \
+     && [ "$(k get pod "$pod" -o jsonpath='{.status.phase}')" = Running ]; then
+    pod_api GET "$pod" "/out/${file:-$name.md}"
+    return
+  fi
+
+  # A finished Job keeps its pod until the TTL expires, and a job answers
+  # on stdout - so its log *is* the result, with no file to collect.
+  if [ -z "$file" ] && k get job "$(job_of "$name")" >/dev/null 2>&1; then
+    # Emptiness is the failure here, not the exit status: once the TTL has
+    # reaped the pod the job object survives and `kubectl logs` succeeds
+    # with nothing to say, which would otherwise look like a blank answer.
+    local log; log="$(k logs "job/$(job_of "$name")" 2>/dev/null | sed '/^\[vm-agent\] /d')"
+    if [ -n "$log" ]; then printf '%s\n' "$log"; return; fi
+  fi
+
+  # Everything is gone. Cellar has the copy the entrypoint pushed - if
+  # this machine is configured for it, which a VM always is and a laptop
+  # usually is not.
+  if command -v s3cmd >/dev/null && [ -n "${CELLAR_BUCKET:-}" ]; then
+    s3cmd get --force --quiet \
+      "s3://$CELLAR_BUCKET/k8s/$name/${file:-$name.md}" /dev/stdout 2>/dev/null && return
+  fi
+  die "nothing to fetch for $name: no running pod, no job log, nothing in Cellar"
+}
+
+# ------------------------------------------------------------------ main
+cmd="${1:-ls}"; shift 2>/dev/null || true
+case "$cmd" in
+  ls|list)  cmd_ls ;;
+  run)      cmd_run "$@" ;;
+  start)    cmd_start "$@" ;;
+  fetch)    cmd_fetch "$@" ;;
+
+  status)
+    if [ $# -eq 0 ]; then cmd_ls; exit 0; fi
+    valid_name "$1"; require_pod "$1"; pod_api GET "$POD" /status | jq . ;;
+
+  prompt)
+    split_target "${1:?usage: swarm prompt <name>[/<agent>] \"text\"}"
+    [ $# -ge 2 ] || die 'usage: swarm prompt <name>[/<agent>] "text"'
+    require_pod "$TGT_NAME"
+    pod_api POST "$POD" "/agents/$TGT_AGENT/prompt" body \
+      <<< "$(jq -nc --arg t "$2" '{text:$t}')" | jq . ;;
+
+  task)
+    # Same reasoning as `fleet task`: agent UIs collapse tool output, so
+    # the terminal is not a transport. Ask for a file instead.
+    split_target "${1:?usage: swarm task <name>[/<agent>] \"text\"}"
+    [ $# -ge 2 ] || die 'usage: swarm task <name>[/<agent>] "text"'
+    full="$2
+
+When you are finished, write your complete answer to ~/out/$TGT_AGENT.md
+(create the directory if needed). That file is how it gets collected - the
+terminal is not read, and this pod's filesystem does not outlive it. Then
+print one line: WROTE ~/out/$TGT_AGENT.md"
+    require_pod "$TGT_NAME"
+    pod_api POST "$POD" "/agents/$TGT_AGENT/prompt" body \
+      <<< "$(jq -nc --arg t "$full" '{text:$t}')" \
+      | jq -r '"submitted; collect with: swarm fetch '"$TGT_NAME $TGT_AGENT"'.md"' ;;
+
+  read)
+    split_target "${1:?usage: swarm read <name>[/<agent>] [-f]}"
+    require_pod "$TGT_NAME"; pod="$POD"; follow=false; source=recent
+    for a in "${@:2}"; do
+      case "$a" in
+        -f|--follow) follow=true ;;
+        visible|recent|recent-unwrapped|detection) source="$a" ;;
+      esac
+    done
+    fetch_read() {
+      pod_api GET "$pod" "/agents/$TGT_AGENT/read?source=$source" \
+        | jq -r '.result.output // .output // .'
+    }
+    if ! $follow; then fetch_read; exit 0; fi
+    # A terminal read is a screen snapshot, not an append-only log, so
+    # this re-renders rather than tailing - closer to `watch` than to
+    # `tail -f`. (`swarm logs -f` is the real tail; it is a different thing.)
+    trap 'printf "\033[?25h\n"; exit 0' INT TERM
+    printf '\033[?25l'
+    while true; do
+      out="$(fetch_read)"
+      st="$(pod_api GET "$pod" "/agents/$TGT_AGENT" | jq -r '.result.agent.agent_status // "?"')"
+      printf '\033[H\033[2J'
+      printf '%s%s/%s  [%s]  refreshing every %ss - ctrl+c to stop%s\n\n' \
+        "$c_dim" "$TGT_NAME" "$TGT_AGENT" "$st" "${SWARM_FOLLOW_INTERVAL:-5}" "$c_off"
+      printf '%s\n' "$out" | tail -n $(( ${LINES:-40} - 4 ))
+      sleep "${SWARM_FOLLOW_INTERVAL:-5}"
+    done ;;
+
+  keys)
+    split_target "${1:?usage: swarm keys <name>[/<agent>] <key>...}"
+    shift
+    [ $# -ge 1 ] || die "usage: swarm keys <name>[/<agent>] <key>..."
+    require_pod "$TGT_NAME"
+    pod_api POST "$POD" "/agents/$TGT_AGENT/keys" body \
+      <<< "$(printf '%s\n' "$@" | jq -Rsc 'split("\n") | map(select(length>0)) | {keys:.}')" \
+      | jq . ;;
+
+  abort)
+    # Retract an order. `prompt` queues *behind* the work in flight, so an
+    # orchestrator that changes its mind has no other way back.
+    split_target "${1:?usage: swarm abort <name>[/<agent>] [--tell \"…\"] [--timeout N]}"
+    shift; tell=""; budget=20
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --tell)    tell="${2:?--tell needs a message}"; shift 2 ;;
+        --timeout) budget="${2:?--timeout needs seconds}"; shift 2 ;;
+        *)         die "unknown option for abort: $1" ;;
+      esac
+    done
+    require_pod "$TGT_NAME"; pod="$POD"
+    agent_status() {
+      pod_api GET "$pod" "/agents/$TGT_AGENT" 2>/dev/null \
+        | jq -r '.result.agent.agent_status // empty'
+    }
+    st="$(agent_status)"
+    [ -n "$st" ] || die "$TGT_NAME/$TGT_AGENT is unreachable, or not a named agent
+    check with: swarm herdr $TGT_NAME agent list"
+    if [ "$st" = working ] || [ "$st" = blocked ]; then
+      half=$(( budget / 2 )); [ "$half" -lt 3 ] && half=3
+      stopped=false
+      for attempt in 1 2; do
+        pod_api POST "$pod" "/agents/$TGT_AGENT/keys" body <<< '{"keys":["esc"]}' >/dev/null
+        printf '%s\n' "$c_dim  esc sent (attempt $attempt), waiting up to ${half}s…$c_off" >&2
+        waited=0
+        while [ "$waited" -lt "$half" ]; do
+          sleep 1; waited=$(( waited + 1 ))
+          st="$(agent_status)"
+          case "$st" in
+            working|blocked) ;;
+            "")              ;;   # a blip in reachability is not an answer
+            *)               stopped=true; break ;;
+          esac
+        done
+        $stopped && break
+      done
+      $stopped || { printf '%s\n' "$c_err  $TGT_NAME/$TGT_AGENT is still $st after ${budget}s$c_off" >&2; exit 1; }
+      printf '%s\n' "$c_ok  aborted - $TGT_NAME/$TGT_AGENT is $st$c_off"
+    else
+      printf '%s\n' "$c_dim  $TGT_NAME/$TGT_AGENT was already $st - nothing to interrupt$c_off"
+    fi
+    if [ -n "$tell" ]; then
+      pod_api POST "$pod" "/agents/$TGT_AGENT/prompt" body \
+        <<< "$(jq -nc --arg t "$tell" '{text:$t}')" >/dev/null
+      printf '%s\n' "$c_ok  told it: $tell$c_off"
+    fi ;;
+
+  out)
+    valid_name "${1:?usage: swarm out <name>}"
+    require_pod "$1"
+    pod_api GET "$POD" /out | jq -r '.files[]? | "\(.bytes)\t\(.name)"' ;;
+
+  logs)
+    valid_name "${1:?usage: swarm logs <name> [-f]}"
+    # Either shape may be behind the name, and a Job's pod has a generated
+    # suffix - so select by label rather than guessing the object.
+    if kubectl -n "$NS" get pod "$(pod_of "$1")" >/dev/null 2>&1; then
+      kubectl -n "$NS" logs "${@:2}" "$(pod_of "$1")" -c agent
+    else
+      kubectl -n "$NS" logs "${@:2}" -l "vm-agent/agent=$1" -c agent --tail=-1
+    fi ;;
+
+  herdr)
+    valid_name "${1:?usage: swarm herdr <name> <args>...   (no args: what is permitted)}"
+    require_pod "$1"; pod="$POD"; shift
+    if [ $# -eq 0 ]; then
+      pod_api GET "$pod" /herdr | jq .
+    else
+      pod_api POST "$pod" /herdr body \
+        <<< "$(printf '%s\n' "$@" | jq -Rsc 'split("\n") | map(select(length>0)) | {argv:.}')" | jq .
+    fi ;;
+
+  attach)
+    valid_name "${1:?usage: swarm attach <name>}"
+    # herdr's own UI, straight over the exec channel - no tmux and no ssh
+    # gateway to work around, which is the one thing easier here than on a
+    # VM. ctrl+b is herdr's prefix; ctrl+b q detaches and leaves it running.
+    require_pod "$1"
+    exec kubectl -n "$NS" exec -it "$POD" -c agent -- sh -lc 'herdr' ;;
+
+  shell)
+    valid_name "${1:?usage: swarm shell <name>}"
+    require_pod "$1"
+    exec kubectl -n "$NS" exec -it "$POD" -c agent -- bash -l ;;
+
+  kill)
+    [ $# -ge 1 ] || die "usage: swarm kill <name>..."
+    for n in "$@"; do
+      valid_name "$n"; killed=false
+      k delete pod "$(pod_of "$n")" --wait=false >/dev/null 2>&1 && killed=true
+      k delete job "$(job_of "$n")" --wait=false >/dev/null 2>&1 && killed=true
+      # The claim is not deleted with the pod: it is the one thing in this
+      # whole arrangement that was asked to outlive it.
+      if $killed; then
+        printf '%s  %s deleted%s\n' "$c_ok" "$n" "$c_off"
+        k get pvc "$(pod_of "$n")" >/dev/null 2>&1 && printf '%s  its volume claim %s is kept - delete it with: kubectl -n %s delete pvc %s%s\n' \
+          "$c_dim" "$(pod_of "$n")" "$NS" "$(pod_of "$n")" "$c_off"
+      else
+        printf '%s  no pod or job named %s%s\n' "$c_dim" "$n" "$c_off"
+      fi
+    done ;;
+
+  reap)
+    # Jobs reap themselves through ttlSecondsAfterFinished; this is for
+    # the ones that failed early, and for pods that crashed out.
+    n="$(k delete pods -l vm-agent/managed=true \
+          --field-selector 'status.phase==Succeeded' --wait=false 2>/dev/null | wc -l)"
+    m="$(k delete pods -l vm-agent/managed=true \
+          --field-selector 'status.phase==Failed' --wait=false 2>/dev/null | wc -l)"
+    printf '%s  reaped %s succeeded, %s failed%s\n' "$c_ok" "$n" "$m" "$c_off" ;;
+
+  get)  require_pod "${1:?usage: swarm get <name> <path>}"
+        pod_api GET "$POD" "${2:?usage: swarm get <name> <path>}" ;;
+  ns)   printf '%s\n' "$NS" ;;
+  *)    die "unknown command: $cmd (try --help)" ;;
+esac

@@ -21,6 +21,12 @@
 #   ./provision.sh --all --forget OPENAI_API_KEY   drop a shared secret
 #   ./provision.sh --dockerd owl                   give owl a Docker daemon
 #
+# Kubernetes needs no flag here. ./cluster.sh builds the cluster and leaves
+# .secrets/kubeconfig.yaml and K8S_IMAGE/K8S_NAMESPACE in fleet.conf; this
+# script picks all three up and publishes them, because publishing to the
+# shared configuration restarts every VM and the check for who is mid-task
+# lives here. After that every box has kubectl, a kubeconfig and `swarm`.
+#
 # Options
 #   --flavor <size>   pico nano XS S M L XL 2XL 3XL - the VM size. Applies
 #                     to every VM this run touches, so `--all --flavor L`
@@ -83,6 +89,8 @@ FLAVOR_EXPLICIT=false
 FLAVOR="${FLAVOR:-M}"
 REGION="${REGION:-par}"
 KEY_PATH="${KEY_PATH:-$SECRETS_DIR/id_ed25519}"
+# Written by ./cluster.sh. Absent simply means this fleet has no cluster.
+KUBECONFIG_PATH="${KUBECONFIG_PATH:-$SECRETS_DIR/kubeconfig.yaml}"
 PER_VM_KEY=false
 DEPLOY=true
 COUNT=1
@@ -384,6 +392,15 @@ SHARED_SECRETS=(
 # Non-secret settings, always taken from the local configuration.
 SHARED_SETTINGS=(GITLAB_HOST GIT_USER_NAME GIT_USER_EMAIL GIT_SIGN_COMMITS CELLAR_BUCKET VM_AGENT_FLEET CLAUDE_PERMISSION_MODE)
 
+# The Kubernetes side. Sticky rather than a plain setting: these are
+# derived by ./cluster.sh, which may have run on another machine or under
+# another checkout, so "I do not have a local value" has to mean "keep
+# what the fleet already has" and not "delete it" - the same rule the
+# secrets below follow. --forget is still the way to take one back out.
+# The kubeconfig belongs in this list on its own merits: it is a
+# credential, and it grants whatever the cluster grants.
+SHARED_STICKY=(VM_AGENT_KUBECONFIG_B64 VM_AGENT_K8S_NAMESPACE VM_AGENT_K8S_IMAGE)
+
 # Private cargo registries cannot be listed in advance - the registry name
 # is part of the variable. Collected from both sides on every run: from the
 # environment so a token captured locally travels, and from the provider so
@@ -429,7 +446,15 @@ sync_shared_config() {
   add_var VM_AGENT_FLEET   "$roster"
   add_var CLAUDE_PERMISSION_MODE "$CLAUDE_PERMISSION_MODE_VALUE"
 
-  for var in "${SHARED_SECRETS[@]}" $(dynamic_secret_names "$current"); do
+  # The cluster's credentials, if this checkout holds them. Each is read
+  # by the loop below through ${!var}, so setting the shell variable is
+  # all there is to do - and leaving it unset is what makes the provider's
+  # copy survive a run from a machine that never saw the cluster.
+  [ -s "$KUBECONFIG_PATH" ] && VM_AGENT_KUBECONFIG_B64="$(base64 -w0 < "$KUBECONFIG_PATH")"
+  VM_AGENT_K8S_NAMESPACE="${K8S_NAMESPACE:-}"
+  VM_AGENT_K8S_IMAGE="${K8S_IMAGE:-}"
+
+  for var in "${SHARED_SECRETS[@]}" "${SHARED_STICKY[@]}" $(dynamic_secret_names "$current"); do
     # --forget is the only way to take a secret back out: an empty local
     # value means "keep what the provider has", not "delete it".
     if [ "${#FORGET[@]}" -gt 0 ] && printf '%s\n' "${FORGET[@]}" | grep -qxF "$var"; then
@@ -461,7 +486,7 @@ sync_shared_config() {
 prune_shadowing_env() {
   local alias="$1" key
   for key in VM_AGENT_SSH_KEY_B64 "${SHARED_SETTINGS[@]}" "${SHARED_SECRETS[@]}" \
-             ${DYNAMIC_SECRETS[@]+"${DYNAMIC_SECRETS[@]}"}; do
+             "${SHARED_STICKY[@]}" ${DYNAMIC_SECRETS[@]+"${DYNAMIC_SECRETS[@]}"}; do
     $PER_VM_KEY && [ "$key" = VM_AGENT_SSH_KEY_B64 ] && continue
     if clever env --format json --alias "$alias" 2>/dev/null \
         | json_has --arg k "$key" '.env[]? | select(.name==$k)'; then
@@ -820,6 +845,13 @@ do_list() {
     dockerd="$(env_value "$name" VM_AGENT_DOCKERD)"
     [ -n "$dockerd" ] && printf '  %-18s %s\n' "" "$c_skip└ docker daemon: $dockerd$c_off"
   done < "$FLEET_FILE"
+
+  # The cluster is fleet-wide, so it is reported once rather than per VM.
+  if [ -s "$KUBECONFIG_PATH" ] || [ -n "${K8S_IMAGE:-}" ]; then
+    hdr "kubernetes"
+    printf '  %s\n' "${c_skip}namespace ${K8S_NAMESPACE:-vm-agent}   image ${K8S_IMAGE:-<none - ./cluster.sh image>}$c_off"
+    printf '  %s\n' "${c_skip}what is running: swarm ls$c_off"
+  fi
 }
 
 # The shared add-ons belong to the whole fleet, so this is only ever safe

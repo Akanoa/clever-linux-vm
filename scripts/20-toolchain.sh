@@ -78,6 +78,9 @@ install_moerae() {
 install_helpers() {
   install -m 755 "$APP_HOME/tools/cellar" "$HOME/.local/bin/cellar"
   install -m 755 "$APP_HOME/tools/fleet"  "$HOME/.local/bin/fleet"
+  # swarm is useful even before kubectl exists: `swarm --help` is how you
+  # find out the fleet can have a cluster at all.
+  install -m 755 "$APP_HOME/tools/swarm"  "$HOME/.local/bin/swarm"
 }
 
 # ripwire - a ranked, deterministic repo map (call graph, churn, test
@@ -119,6 +122,6 @@ for pid in "${pids[@]}"; do wait "$pid"; done
 step install_helpers install_helpers || true
 
 log "installed:"
-for c in herdr claude opencode codex gh glab cellar fleet moerae ripwire specify; do
+for c in herdr claude opencode codex gh glab cellar fleet swarm moerae ripwire specify; do
   printf '[vm-agent]   %-10s %s\n' "$c" "$(command -v "$c" 2>/dev/null || echo 'MISSING')"
 done

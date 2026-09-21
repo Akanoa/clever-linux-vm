@@ -61,3 +61,26 @@
 # Only read by ./new-fleet.sh, to offer your last answers as defaults.
 : "${AGENT_BASE:=agent}"
 : "${AGENT_COUNT:=2}"
+
+# ------------------------------------------------------------ kubernetes
+# The other half of the fleet: a Clever Cloud Kubernetes cluster where
+# agents are spawned as pods instead of living on VMs. Nothing below has
+# any effect until ./cluster.sh create has actually made one.
+#
+# The cluster is shared by the fleet, like the three add-ons above, and is
+# found by name - so renaming it here points cluster.sh at a *different*
+# cluster rather than renaming the one you have.
+: "${K8S_CLUSTER:=vm-agent-k8s}"
+: "${K8S_NAMESPACE:=vm-agent}"
+
+# Where the agent image lives. `./cluster.sh image` fills both of these in
+# for you on its first successful push - K8S_IMAGE_PROJECT defaults to
+# <your gitlab user>/vm-agent-images, created on confirmation.
+# : "${K8S_IMAGE_PROJECT:=your-name/vm-agent-images}"
+# : "${K8S_IMAGE:=registry.gitlab.com/your-name/vm-agent-images/agent:latest}"
+: "${K8S_IMAGE_TAG:=latest}"
+
+# What one agent pod asks for. A pod that only edits and tests code is
+# happy here; one that compiles a large Rust workspace is not.
+: "${K8S_AGENT_CPU:=1}"
+: "${K8S_AGENT_MEMORY:=2Gi}"
