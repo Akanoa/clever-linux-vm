@@ -39,7 +39,7 @@
 #   --timeout <seconds>               run only: budget for the whole job
 #   --ttl <seconds>                   run only: how long the finished pod is
 #                                     kept so its log can still be read
-#                                     (default 3600). 0 deletes it the
+#                                     (default 900). 0 deletes it the
 #                                     moment it finishes - pair that with
 #                                     --wait, or the answer goes with it.
 #   --pvc <size>                      start only: a persistent ~/workspace
@@ -266,7 +266,11 @@ dedent4() { sed 's/^    //'; }
 
 # ---------------------------------------------------------------- flags
 KIND=claude; REPO=""; REF=""; IMAGE=""; CPU=""; MEM=""
-TIMEOUT=3600; TTL=3600; PVC=""; WAIT=false; OVERRIDES=(); OVERRIDE_MODE=""
+# 15 minutes: long enough to `swarm fetch` an answer at human speed, short
+# enough that a morning of fan-outs is not still on the cluster at lunch.
+# The pod holds no CPU or memory once it is Succeeded, but a page of them
+# reads like a leak, and reading your own tools as broken has a cost too.
+TIMEOUT=3600; TTL=900; PVC=""; WAIT=false; OVERRIDES=(); OVERRIDE_MODE=""
 parse_opts() {
   while [ $# -gt 0 ]; do
     case "$1" in
