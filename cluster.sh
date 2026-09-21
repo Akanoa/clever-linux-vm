@@ -358,7 +358,21 @@ ensure_deploy_token() {
   ok "deploy token created and saved to .secrets/registry.env"
 }
 
-image_ref() { printf '%s/%s/%s:%s' "$REGISTRY" "$IMAGE_PROJECT" "$IMAGE_NAME" "$IMAGE_TAG"; }
+# Docker repository names must be lowercase; GitLab namespaces need not be,
+# and plenty are not - `Akanoa/vm-agent-images` is a perfectly ordinary
+# project path that docker rejects outright ("repository name must be
+# lowercase"). GitLab resolves the lowercased path to the same project's
+# registry, so folding the case here is correct rather than a workaround.
+#
+# Only the path is folded. A tag is case-sensitive to docker, so `:v1.2-RC`
+# has to survive intact - lowercasing the whole reference would quietly
+# push somewhere else.
+image_ref() {
+  local path
+  path="$(printf '%s/%s/%s' "$REGISTRY" "$IMAGE_PROJECT" "$IMAGE_NAME" \
+    | tr '[:upper:]' '[:lower:]')"
+  printf '%s:%s' "$path" "$IMAGE_TAG"
+}
 
 cmd_image() {
   hdr "agent image"
