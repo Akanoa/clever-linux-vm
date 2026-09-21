@@ -294,6 +294,12 @@ environment, answer on stdout. Because it is headless, it does *not* have
 the problem `fleet task` works around — no UI is collapsing tool output,
 so the answer comes back whole.
 
+**A job's log is silent until it finishes.** `claude -p` and its
+equivalents buffer — they print the whole answer at the end and nothing
+before it — so `swarm logs -f` on a job shows the boot sequence and then
+waits. That is the agent working, not a hang. Only `swarm start` pods have
+a pane to watch, through `swarm read`.
+
 **A finished job stays `Succeeded` for an hour, on purpose.** Its log is
 where the answer is until something collects it, so do not read a
 lingering pod as a failure to clean up — a `Succeeded` pod holds no CPU or

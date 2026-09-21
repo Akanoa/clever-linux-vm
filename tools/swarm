@@ -24,7 +24,10 @@
 #   swarm abort <name>[/<agent>]      interrupt whatever it is doing
 #   swarm fetch <name> [file]         the answer: from the pod, its log, or Cellar
 #   swarm out <name>                  list a pod's result files
-#   swarm logs <name> [-f]            container log (this is where a Job answers)
+#   swarm logs <name> [-f]            container log (this is where a Job
+#                                     answers - but only at the very end:
+#                                     a headless agent buffers, so -f is
+#                                     silent until the work is finished)
 #   swarm herdr <name> <args>...      any permitted herdr subcommand
 #   swarm attach <name>               the pod's herdr UI, over kubectl exec
 #   swarm shell <name>                a shell in the pod
@@ -290,6 +293,8 @@ parse_opts() {
       --memory)  MEM="${2:?--memory needs a value}"; shift 2 ;;
       --timeout) TIMEOUT="${2:?--timeout needs seconds}"; shift 2 ;;
       --ttl)     TTL="${2:?--ttl needs seconds}"; shift 2 ;;
+      # (both validated below - they are interpolated into the manifest,
+      #  where a non-number is rejected by the API rather than by us)
       --pvc)     PVC="${2:?--pvc needs a size, e.g. 10Gi}"; shift 2 ;;
       --env)     OVERRIDES+=("${2:?--env needs NAME=VALUE}"); shift 2 ;;
       --wait)    WAIT=true; shift ;;
@@ -300,6 +305,8 @@ parse_opts() {
   CPU="${CPU:-${K8S_AGENT_CPU:-1}}"
   MEM="${MEM:-${K8S_AGENT_MEMORY:-2Gi}}"
   case "$KIND" in claude|codex|opencode) ;; *) die "unsupported kind: $KIND" ;; esac
+  case "$TIMEOUT" in ''|*[!0-9]*) die "--timeout wants whole seconds, got '$TIMEOUT'" ;; esac
+  case "$TTL"     in ''|*[!0-9]*) die "--ttl wants whole seconds, got '$TTL'" ;; esac
   [ -n "$IMAGE" ] || die "no image - set VM_AGENT_K8S_IMAGE, or pass --image
     build and publish one with: ./cluster.sh image"
 }
@@ -324,6 +331,15 @@ cmd_ls() {
       "$(age_of "$created")" "${restarts:-0}" "${image##*/}"
   done <<< "$out"
   $none && printf '  %snothing running in namespace %s%s\n' "$c_dim" "$NS" "$c_off"
+}
+
+# Integer minutes turn a 10-second TTL into "0 min", which reads as "gone
+# immediately" - the opposite of what the caller asked for, and wrong.
+human_duration() {  # seconds -> 45s / 15 min / 2 h
+  local s="$1"
+  if   [ "$s" -lt 60 ];   then printf '%ss' "$s"
+  elif [ "$s" -lt 3600 ]; then printf '%s min' $(( s / 60 ))
+  else                         printf '%s h' $(( s / 3600 )); fi
 }
 
 age_of() {  # an ISO timestamp -> 3m / 2h / 4d
@@ -382,19 +398,29 @@ spec:
 $(common_pod_spec "$name" job "$KIND" "$IMAGE" "$CPU" "$MEM" "$EXTRA_ENV" | strip_blanks)
 MANIFEST
   printf '%s  %s dispatched (%s, %ss budget)%s\n' "$c_ok" "$name" "$KIND" "$TIMEOUT" "$c_off"
-  printf '%s  follow it with: swarm logs %s -f   collect it with: swarm fetch %s%s\n' \
-    "$c_dim" "$name" "$name" "$c_off"
+  # Not "follow it with -f". A headless agent buffers: `claude -p` and its
+  # equivalents print the whole answer at the end and nothing before it, so
+  # `logs -f` on a job shows the boot sequence and then sits in silence for
+  # however long the work takes. That reads as a hang, which is the wrong
+  # thing for this line to suggest. `swarm read` streams, but only for the
+  # pane agents `swarm start` creates - a job has no pane.
+  printf '%s  swarm fetch %s   - the answer, once it has finished%s\n' \
+    "$c_dim" "$name" "$c_off"
+  printf '%s  swarm logs %s    - boot progress; the agent itself prints nothing until it is done%s\n' \
+    "$c_dim" "$name" "$c_off"
   # The pod outliving its own work is the design, not a leak - its log is
   # where the answer is until something collects it - but "disposable" sets
   # the opposite expectation, so say how long and how to cut it short.
-  if [ "$TTL" -eq 0 ] 2>/dev/null; then
+  if [ "$TTL" -eq 0 ]; then
     printf '%s  it deletes itself the moment it finishes (--ttl 0), so collect it with --wait%s\n' \
       "$c_dim" "$c_off"
   else
-    printf '%s  it stays Succeeded for %s min after finishing so the answer can be read;%s\n' \
-      "$c_dim" "$(( TTL / 60 ))" "$c_off"
+    printf '%s  it stays Succeeded for %s after finishing so the answer can be read;%s\n' \
+      "$c_dim" "$(human_duration "$TTL")" "$c_off"
     printf '%s  `swarm kill %s` removes it now, `--ttl 0` would not have kept it at all%s\n' \
       "$c_dim" "$name" "$c_off"
+    [ "$TTL" -lt 60 ] && printf '%s  that is short - pair a small --ttl with --wait, or the pod goes first%s\n' \
+      "$c_dim" "$c_off"
   fi
 
   if $WAIT; then
@@ -578,7 +604,9 @@ print one line: WROTE ~/out/$TGT_AGENT.md"
     if ! $follow; then fetch_read; exit 0; fi
     # A terminal read is a screen snapshot, not an append-only log, so
     # this re-renders rather than tailing - closer to `watch` than to
-    # `tail -f`. (`swarm logs -f` is the real tail; it is a different thing.)
+    # `tail -f`. (`swarm logs -f` is the real tail, and only pane agents
+    # produce anything worth tailing - a headless job writes its answer in
+    # one go at the end.)
     trap 'printf "\033[?25h\n"; exit 0' INT TERM
     printf '\033[?25l'
     while true; do

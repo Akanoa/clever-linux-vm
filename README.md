@@ -644,6 +644,11 @@ prompt in its environment and the answer on stdout. Ten of them in
 parallel cost nothing to set up, which is the entire point of doing this
 in a cluster rather than on boxes.
 
+Its log stays quiet while it runs. `claude -p` buffers, so `swarm logs -f`
+on a job shows the boot sequence and then nothing until the answer arrives
+in one piece — that is the agent thinking, not a stall. `swarm read` is
+the live view, and only `swarm start` pods have a pane for it.
+
 A finished job **does not disappear immediately, and should not**: its log
 is where the answer lives until something collects it, so the pod is kept
 `Succeeded` for an hour (`ttlSecondsAfterFinished`, `--ttl` to change it)
