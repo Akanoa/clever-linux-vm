@@ -22,6 +22,11 @@
 # it wants before touching anything, so re-running is a no-op and
 # re-running after a failure resumes.
 #
+# The one prerequisite is the fleet's shared Configuration provider, which
+# is where a pod's credentials come from. That is an add-on, not a VM:
+# `./provision.sh --shared-only` creates it and creates no box, so a fleet
+# whose agents are all pods never needs one.
+#
 # Options
 #   --org <id|name>   organisation to build in (default: fleet.conf, else
 #                     your personal space)
@@ -157,16 +162,25 @@ cmd_create() {
   ensure_feature
 
   # A pod's credentials come from the fleet's Configuration provider -
-  # there is no second place to get them - so a cluster with no fleet
-  # behind it has nothing to hand an agent. Checked here rather than in
-  # bootstrap, three steps later: a control plane bills from the moment it
-  # exists, and "created, then could not be wired up" is the one failure
-  # this script must not produce.
+  # there is no second place to get them - so a cluster without one has
+  # nothing to hand an agent. Checked here rather than in bootstrap, three
+  # steps later: a control plane bills from the moment it exists, and
+  # "created, then could not be wired up" is the one failure this script
+  # must not produce.
+  #
+  # What is missing is an *add-on*, not a VM. The cluster needs the
+  # fleet's shared secrets; it has no use for a box, and no way to reach
+  # an FS Bucket. `--shared-only` creates exactly that and nothing else,
+  # so a fleet whose agents are all pods never creates a VM.
   if [ -z "$(addon_real_id_by_name "$CONFIG_ADDON")" ]; then
     die "no Configuration provider named $CONFIG_ADDON in this organisation.
-    The cluster shares the fleet's secrets, so build the fleet first:
-      ./new-fleet.sh          (first time, needs a terminal)
-      ./provision.sh --all    (if fleet.conf and .secrets/tokens.env exist)
+    Pods read the fleet's shared secrets from it - the agent tokens, the
+    commit key, the fleet token - so it has to exist first. It is a free
+    add-on and needs no VM:
+
+      ./agent-tokens.sh claude       store an agent credential
+      ./provision.sh --shared-only   create and publish the shared config
+
     Then re-run this. Nothing has been created."
   fi
 
@@ -497,7 +511,8 @@ cmd_secrets() {
 
   local config_id env_json
   config_id="$(addon_real_id_by_name "$CONFIG_ADDON")"
-  [ -n "$config_id" ] || die "no Configuration provider named $CONFIG_ADDON - is the fleet provisioned?"
+  [ -n "$config_id" ] || die "no Configuration provider named $CONFIG_ADDON.
+    Create it with: ./provision.sh --shared-only   (no VM required)"
   env_json="$(cp_read "$config_id")"
   printf '%s' "$env_json" | json_has 'length > 0' \
     || die "the shared configuration $CONFIG_ADDON is empty or unreadable"

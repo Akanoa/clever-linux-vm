@@ -144,7 +144,15 @@ variable of the same name overrides it, so a one-off
 Options: `--flavor`, `--region`, `--config <addon-name>`,
 `--cellar <addon-name>`, `--key <path>`, `--per-vm-key`, `--no-deploy`,
 `--no-roster`, `--forget <VAR>`, `--dockerd` / `--dockerd-flavor` (see
-[Docker and Testcontainers](#docker-and-testcontainers)).
+[Docker and Testcontainers](#docker-and-testcontainers)), and
+`--shared-only`.
+
+`--shared-only` stops after the shared half: the Configuration provider,
+the Cellar bucket, the commit key and the fleet token, with no VM created
+and no FS Bucket either — only a VM mounts one of those. It exists because
+the Kubernetes side needs the fleet's secrets and nothing else, so a fleet
+whose agents are all pods should not have to create a box to get them. See
+[Agents in Kubernetes](#agents-in-kubernetes).
 
 Tokens come from `.secrets/tokens.env` (gitignored) or the surrounding
 environment. **An empty local token never blanks one already in the
@@ -598,11 +606,19 @@ API — so `swarm` is `fleet` with a different transport, not a second
 system to learn.
 
 ```bash
+./provision.sh --shared-only       # the shared add-ons and config - no VM
 ./cluster.sh create                # the cluster, and .secrets/kubeconfig.yaml
 ./cluster.sh image                 # build the agent image, push it to GitLab
-./provision.sh --all --no-deploy   # hand the kubeconfig to the VM fleet
 swarm run review "review src/auth for injection bugs" --repo git@… --wait
 ```
+
+The first line is the only dependency on the rest of this repository, and
+it creates no VM. A pod reads the fleet's secrets — the agent tokens, the
+commit key, the fleet token — from the shared Configuration provider, so
+that add-on has to exist; it is free, and `--shared-only` creates it, the
+Cellar bucket and nothing else. **A fleet whose agents are all pods never
+creates a box.** If you do also run VMs, `./provision.sh --all --no-deploy`
+afterwards hands them the kubeconfig so they can spawn pods too.
 
 `cluster.sh` is idempotent the way `provision.sh` is: every step checks the
 state it wants before touching anything. `./cluster.sh doctor` walks the

@@ -123,6 +123,10 @@ add-ons, writes the shared config and deploys:
 ./provision.sh agent --count 2         # agent-1, agent-2
 ```
 
+For a **pod-only fleet**, stop one step earlier — `./provision.sh
+--shared-only` creates and publishes everything the agents share without
+creating a box, and `./cluster.sh create` takes it from there.
+
 **4. Register the commit key** — it is printed at the end of the run, and
 git pushes fail until it is registered as **both** an authentication and a
 signing key. With the tokens already in hand you can do this yourself:
@@ -333,11 +337,20 @@ every agent in the cluster.
 
 ### Creating the cluster
 
-**The fleet comes first.** A pod's credentials come from the fleet's
-Configuration provider — there is no second place to get them — so
-`cluster.sh create` refuses, before creating anything, if that add-on does
-not exist. Build the VM fleet first, even if you only ever intend to use
-pods.
+**The shared config comes first — not a VM.** A pod's credentials come
+from the fleet's Configuration provider, and there is no second place to
+get them, so `cluster.sh create` refuses (before creating anything) if
+that add-on is missing. What it wants is the *add-on*, which is free and
+needs no box:
+
+```bash
+./agent-tokens.sh claude       # or: set ANTHROPIC_API_KEY
+./provision.sh --shared-only   # the shared add-ons and config, no VM
+```
+
+A fleet whose agents are all pods never has to create a VM at all. The FS
+Bucket is skipped too — only a VM mounts one — so `--shared-only` leaves a
+Configuration provider and a Cellar bucket and stops there.
 
 **Do this from a laptop, not from a VM.** The VMs hold the kubeconfig,
 which is enough to start and kill agent pods, but deliberately not Clever
@@ -357,7 +370,8 @@ Prerequisites, all on the machine you are running from:
 | | |
 |---|---|
 | `clever login` done | `clever profile` succeeds |
-| A provisioned fleet | `./provision.sh --list` shows VMs |
+| The shared config published | `./provision.sh --shared-only` (no VM needed) |
+| An agent credential in it | or the pods start with no model access |
 | Docker or podman | to build the image |
 | `GITLAB_TOKEN` with `write_registry` | to push it |
 
@@ -407,7 +421,7 @@ the first thing missing rather than the last thing that failed.
 
 | Symptom | What it means |
 |---|---|
-| *no Configuration provider named …* | No fleet in this organisation yet. Nothing was created. Build the fleet first. |
+| *no Configuration provider named …* | The shared config does not exist yet. Nothing was created. `./provision.sh --shared-only` — it needs no VM. |
 | *your quota exceeded, contact support* | The offer is quota-limited. If the organisation's Kubernetes quota is zero or already spent, this needs a support request, not a flag — `clever k8s quota` shows it on clever-tools 4.9+. |
 | `create` sits on `CREATING` for a long time | Normal. It polls for 30 minutes before giving up. |
 | *could not log in to registry.gitlab.com* | `GITLAB_TOKEN` is missing `write_registry`, or is expired. `glab auth status` checks it. |
