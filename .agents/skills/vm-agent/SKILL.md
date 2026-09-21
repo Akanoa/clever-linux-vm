@@ -381,8 +381,14 @@ non-interactive, so a partial failure is re-run rather than unpicked:
 ```bash
 ./cluster.sh create --yes     # 5-15 min: cluster, kubeconfig, namespace, secrets
 ./cluster.sh image --yes      # 5-10 min: build the image, push it to GitLab
-./provision.sh --all --no-deploy   # hand the kubeconfig to the VM fleet
 ./cluster.sh doctor           # checks the whole path, names the first gap
+```
+
+**Only if the fleet also has VMs**, one more — it is how a *VM* learns to
+drive the cluster, and on an empty roster `--all` correctly refuses:
+
+```bash
+./provision.sh --all --no-deploy   # hand them the kubeconfig and image
 ```
 
 What each one actually does:
@@ -399,11 +405,14 @@ What each one actually does:
   creates a `read_registry` deploy token for the cluster to pull with, and
   records `K8S_IMAGE` in `fleet.conf`.
 * **`provision.sh --all --no-deploy`** publishes the kubeconfig, namespace
-  and image to the shared config. **This restarts every VM**, so check
-  `fleet agents` for busy ones first — it refuses if any agent is working,
-  and `--force` overrides.
+  and image to the shared config, so the VMs can spawn pods too. **This
+  restarts every VM**, so check `fleet agents` for busy ones first — it
+  refuses if any agent is working, and `--force` overrides. Skip it
+  entirely on a pod-only fleet: there is nobody to publish to, `swarm`
+  reads `.secrets/k8s.env` here, and `--all` would only tell you the
+  roster is empty.
 
-Only the third step needs the fleet to be quiet. The first two touch
+Only that last step needs the fleet to be quiet. The first two touch
 nothing the VMs are using.
 
 After that, `swarm` works on every VM and on this machine. Confirm with
@@ -427,7 +436,8 @@ the first thing missing rather than the last thing that failed.
 | *registry.gitlab.com rejected the credential* | Checked before the build, so nothing is wasted. Usually an OAuth token from a browser `glab auth login`, which the registry does not accept — store a PAT with `write_registry` instead. |
 | *docker buildx is unusable here* | Environmental, not fatal: docker falls back to the legacy builder and `cluster.sh` says so. Fix or remove `~/.docker/cli-plugins/docker-buildx` to silence docker's own DEPRECATED notice. |
 | `ImagePullBackOff` on every pod | The pull secret is stale or the tag does not exist. Re-run `./cluster.sh image --yes`. |
-| `swarm` says *no kubectl* | The kubeconfig was never published. `./provision.sh --all --no-deploy`. |
+| `swarm` says *no kubectl* | On a VM: the kubeconfig was never published — `./provision.sh --all --no-deploy`. On a laptop: `./cluster.sh kubeconfig`. |
+| `--all` says *vms.txt is empty* | A pod-only fleet has no roster to apply to. `./provision.sh --shared-only` publishes the shared config with no VM; the cluster needs nothing else. |
 | `swarm` says *no image* | `K8S_IMAGE` was never published. Same fix, after `./cluster.sh image`. |
 
 ### Sizing, and what this repository does not wrap
