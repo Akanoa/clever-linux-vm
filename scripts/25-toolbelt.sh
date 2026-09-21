@@ -85,8 +85,13 @@ swarm ls                                           # what is running
 ```
 
 `swarm run` is the one to reach for. It is a single headless run: the
-prompt goes in, the agent's answer comes back on stdout, the pod is reaped.
-Ten of them in parallel cost nothing to set up, which is the whole point.
+prompt goes in, the agent's answer comes back on stdout. Ten of them in
+parallel cost nothing to set up, which is the whole point.
+
+A finished job stays `Succeeded` for an hour before Kubernetes deletes it -
+its log is where the answer is until you collect it. That is not a leak,
+and a `Succeeded` pod costs no CPU or memory. `swarm kill <name>` removes
+one now, `swarm reap` removes all the finished ones.
 
 `swarm start <name>` is the other shape - a long-lived pod with herdr in
 it, driven by `swarm prompt|read|abort|task|fetch`, exactly the verbs

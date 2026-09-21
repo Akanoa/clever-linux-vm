@@ -290,9 +290,16 @@ swarm kill <name>                                  # stop one
 
 **`swarm run` is the default choice.** It is a Kubernetes Job running the
 agent headless (`claude -p`, `codex exec`, `opencode run`): prompt in the
-environment, answer on stdout, pod reaped by its TTL. Because it is
-headless, it does *not* have the problem `fleet task` works around — no
-UI is collapsing tool output, so the answer comes back whole.
+environment, answer on stdout. Because it is headless, it does *not* have
+the problem `fleet task` works around — no UI is collapsing tool output,
+so the answer comes back whole.
+
+**A finished job stays `Succeeded` for an hour, on purpose.** Its log is
+where the answer is until something collects it, so do not read a
+lingering pod as a failure to clean up — a `Succeeded` pod holds no CPU or
+memory. `swarm kill <name>` removes one now, `swarm reap` removes every
+finished one, `--ttl <seconds>` changes the window and `--ttl 0` drops it
+entirely (only sensible with `--wait`).
 
 Fanning out is just a loop; they are independent and cost nothing to set up:
 

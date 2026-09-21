@@ -37,7 +37,11 @@
 #   --image <ref>                     override VM_AGENT_K8S_IMAGE
 #   --cpu <n> --memory <size>         resources (default 1 / 2Gi)
 #   --timeout <seconds>               run only: budget for the whole job
-#   --ttl <seconds>                   run only: how long the finished pod is kept
+#   --ttl <seconds>                   run only: how long the finished pod is
+#                                     kept so its log can still be read
+#                                     (default 3600). 0 deletes it the
+#                                     moment it finishes - pair that with
+#                                     --wait, or the answer goes with it.
 #   --pvc <size>                      start only: a persistent ~/workspace
 #   --env NAME=VALUE                  override one variable from the cluster
 #                                     secret, for this pod only (repeatable)
@@ -338,11 +342,25 @@ MANIFEST
   printf '%s  %s dispatched (%s, %ss budget)%s\n' "$c_ok" "$name" "$KIND" "$TIMEOUT" "$c_off"
   printf '%s  follow it with: swarm logs %s -f   collect it with: swarm fetch %s%s\n' \
     "$c_dim" "$name" "$name" "$c_off"
+  # The pod outliving its own work is the design, not a leak - its log is
+  # where the answer is until something collects it - but "disposable" sets
+  # the opposite expectation, so say how long and how to cut it short.
+  if [ "$TTL" -eq 0 ] 2>/dev/null; then
+    printf '%s  it deletes itself the moment it finishes (--ttl 0), so collect it with --wait%s\n' \
+      "$c_dim" "$c_off"
+  else
+    printf '%s  it stays Succeeded for %s min after finishing so the answer can be read;%s\n' \
+      "$c_dim" "$(( TTL / 60 ))" "$c_off"
+    printf '%s  `swarm kill %s` removes it now, `--ttl 0` would not have kept it at all%s\n' \
+      "$c_dim" "$name" "$c_off"
+  fi
 
   if $WAIT; then
     k wait --for=condition=complete --timeout="$(( TIMEOUT + 300 ))s" "job/$job" >/dev/null 2>&1 \
       || k wait --for=condition=failed --timeout=10s "job/$job" >/dev/null 2>&1
     cmd_fetch "$name"
+    [ "$TTL" -gt 0 ] 2>/dev/null && printf '%s\n  collected - `swarm kill %s` removes the pod now%s\n' \
+      "$c_dim" "$name" "$c_off"
   fi
 }
 

@@ -640,9 +640,18 @@ swarm start <name> [kind] [--repo <url>]            # a Pod: herdr inside, drive
 
 **`swarm run` is the one to reach for.** It is a Kubernetes Job running the
 agent headless — `claude -p`, `codex exec`, `opencode run` — with the
-prompt in its environment and the answer on stdout. The pod is reaped by
-`ttlSecondsAfterFinished`. Ten of them in parallel cost nothing to set up,
-which is the entire point of doing this in a cluster rather than on boxes.
+prompt in its environment and the answer on stdout. Ten of them in
+parallel cost nothing to set up, which is the entire point of doing this
+in a cluster rather than on boxes.
+
+A finished job **does not disappear immediately, and should not**: its log
+is where the answer lives until something collects it, so the pod is kept
+`Succeeded` for an hour (`ttlSecondsAfterFinished`, `--ttl` to change it)
+and then deleted by Kubernetes. A `Succeeded` pod holds no CPU or memory —
+it is a record, not a workload. `swarm kill <name>` removes one now,
+`swarm reap` removes every finished one, and `--ttl 0` means "delete the
+moment it finishes", which only makes sense with `--wait` or the answer
+goes with it.
 
 Headless mode also sidesteps the problem that shaped `fleet task`: a
 pane agent's UI collapses tool output, so the terminal is not a transport
